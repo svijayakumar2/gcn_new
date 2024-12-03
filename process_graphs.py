@@ -13,7 +13,7 @@ import concurrent
 import networkx as nx
 from glob import glob
 import multiprocessing as mp
-import gzip
+import gzip 
 
 
 class BAPInstruction:
@@ -325,8 +325,15 @@ class ParallelBAPProcessor:
                 node_features.append(features)
 
             # Save with compression
-            filename = hashlib.md5(cfg_file.encode()).hexdigest()
-            output_file = os.path.join(self.output_path, f"{filename}.json.gz")
+            print(f"Processing {cfg_file}")
+            filename = cfg_file.rsplit('/', 1)[-1]
+            # Extract the part before the first underscore
+            hash_part = filename.split('_')[0]
+
+            print(hash_part)
+
+            output_file = os.path.join(self.output_path, f"{hash_part}.json.gz")
+            print(f"Saving to {output_file}")
             
             data = {
                 'file': cfg_file,
@@ -421,7 +428,7 @@ def main():
     # Initialize processor
     processor = ParallelBAPProcessor(
         num_workers=mp.cpu_count(),
-        output_path='cfg_analysis_results'
+        output_path='cfg_analysis_results2'
     )
     
     # Define path pattern for CFG files
@@ -436,5 +443,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-# if this doesnt work check the other server's version of this file 
