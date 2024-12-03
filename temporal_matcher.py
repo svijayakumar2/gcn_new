@@ -70,10 +70,7 @@ def convert_to_pytorch_geometric(graph_structure):
     data.num_nodes = x.size(0)
     return data
 
-def get_md5_filename(sha):
-    """Generate MD5 filename from SHA using original path structure."""
-    original_path = f"/large/bodmas/exe_cfg/{sha}_refang_cfg.exe"
-    return hashlib.md5(original_path.encode()).hexdigest() + '.json.gz'
+
 
 def process_dataset(metadata_csv, results_dir, batch_size=100, train_ratio=0.7, val_ratio=0.15):
     """Process the dataset into temporal batches using cleaned metadata."""
@@ -82,9 +79,9 @@ def process_dataset(metadata_csv, results_dir, batch_size=100, train_ratio=0.7, 
     df = pd.read_csv(metadata_csv)
     df['timestamp'] = pd.to_datetime(df['timestamp'])
     
-    # Generate MD5 filenames
-    print("Generating MD5 filenames...")
-    df['filename'] = df['sha'].apply(get_md5_filename)
+    print("Generating filenames...")
+    # use sha .json.gz 
+    df['filename'] = df['sha'].apply(lambda sha: f"{sha}.json.gz")
     df = df.sort_values('timestamp')
     
     # Create splits
