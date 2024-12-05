@@ -2,155 +2,224 @@ import os
 import gzip
 import json
 import torch
-import hashlib
+import logging
 import pandas as pd
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, List, Optional
 from torch_geometric.data import Data
+from tqdm import tqdm
 
-def clean_timestamps(metadata_csv, output_csv='bodmas_metadata_cleaned.csv'):
-    """Clean and standardize timestamps in metadata."""
-    print(f"Reading from {metadata_csv}...")
-    df = pd.read_csv(metadata_csv)
-    print("\nSample of original timestamps:")
-    print(df['timestamp'].head())
-    
-    # Convert mixed format timestamps to standard UTC format
-    def convert_timestamp(ts):
-        try:
-            # Try MM/DD/YY format first
-            dt = pd.to_datetime(ts, format='%m/%d/%y %H:%M', utc=True)
-        except:
-            try:
-                # Try ISO format with timezone
-                dt = pd.to_datetime(ts, format='%Y-%m-%d %H:%M:%S%z', utc=True)
-            except:
-                # Last resort: try mixed format
-                dt = pd.to_datetime(ts, format='mixed', utc=True)
-        return dt.strftime('%Y-%m-%d %H:%M:%S UTC')
-    
-    df['timestamp'] = df['timestamp'].apply(convert_timestamp)
-    print("\nSample of standardized timestamps:")
-    print(df['timestamp'].head())
-    
-    df.to_csv(output_csv, index=False)
-    print(f"Saved cleaned metadata to {output_csv}")
-    return output_csv
+# Set up logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
-def convert_to_pytorch_geometric(graph_structure):
-    """Convert graph structure to PyG format."""
-    # Get all unique feature keys
-    feature_keys = sorted(list({
-        key for node in graph_structure['node_features'] 
-        for key in node.keys()
-    }))
+class TimestampCleaner:
+    """Handle timestamp cleaning and standardization."""
     
-    # Create feature vectors
-    node_feats = []
-    for node in graph_structure['node_features']:
-        feats = [
-            float(node.get(key, 0)) if not isinstance(node.get(key), bool)
-            else float(node.get(key, False))
-            for key in feature_keys
+    @staticmethod
+    def standardize_timestamp(ts: str) -> str:
+        """Convert various timestamp formats to standard UTC format."""
+        timestamp_formats = [
+            '%m/%d/%y %H:%M',
+            '%Y-%m-%d %H:%M:%S%z',
+            '%Y-%m-%d %H:%M:%S',
+            '%Y-%m-%d %H:%M'
         ]
-        node_feats.append(feats)
-    
-    # Convert to tensors
-    x = torch.tensor(node_feats, dtype=torch.float) if node_feats else \
-        torch.zeros((1, len(feature_keys)), dtype=torch.float)
         
-    edge_index = torch.tensor(graph_structure['edge_index'], dtype=torch.long).t() \
-        if graph_structure['edge_index'] else torch.zeros((2, 0), dtype=torch.long)
+        for fmt in timestamp_formats:
+            try:
+                dt = pd.to_datetime(ts, format=fmt)
+                return dt.tz_localize('UTC' if dt.tz is None else None).strftime('%Y-%m-%d %H:%M:%S UTC')
+            except ValueError:
+                continue
         
-    edge_attr = None
-    if graph_structure['edge_features']:
-        edge_feats = [[float(edge['condition'] is not None)] 
-                     for edge in graph_structure['edge_features']]
-        edge_attr = torch.tensor(edge_feats, dtype=torch.float)
-    
-    data = Data(x=x, edge_index=edge_index, edge_attr=edge_attr)
-    data.num_nodes = x.size(0)
-    return data
+        try:
+            # Last resort: try pandas' flexible parser
+            dt = pd.to_datetime(ts)
+            return dt.tz_localize('UTC' if dt.tz is None else None).strftime('%Y-%m-%d %H:%M:%S UTC')
+        except Exception as e:
+            logger.error(f"Failed to parse timestamp {ts}: {str(e)}")
+            return None
 
-
-
-def process_dataset(metadata_csv, results_dir, batch_size=100, train_ratio=0.7, val_ratio=0.15):
-    """Process the dataset into temporal batches using cleaned metadata."""
-    # Load metadata
-    print("Loading metadata...")
-    df = pd.read_csv(metadata_csv)
-    df['timestamp'] = pd.to_datetime(df['timestamp'])
-    
-    print("Generating filenames...")
-    # use sha .json.gz 
-    df['filename'] = df['sha'].apply(lambda sha: f"{sha}.json.gz")
-    df = df.sort_values('timestamp')
-    
-    # Create splits
-    n_train = int(len(df) * train_ratio)
-    n_val = int(len(df) * val_ratio)
-    splits = {
-        'train': df.iloc[:n_train],
-        'val': df.iloc[n_train:n_train + n_val],
-        'test': df.iloc[n_train + n_val:]
-    }
-    
-    # Process each split
-    total_graphs = 0
-    for split_name, split_df in splits.items():
-        print(f"\nProcessing {split_name} split...")
-        os.makedirs(f'bodmas_batches/{split_name}', exist_ok=True)
-        split_graphs = 0
+    @classmethod
+    def clean_metadata_timestamps(cls, metadata_path: str, output_path: Optional[str] = None) -> pd.DataFrame:
+        """Clean and standardize timestamps in metadata file."""
+        logger.info(f"Reading metadata from {metadata_path}")
+        df = pd.read_csv(metadata_path)
         
-        for batch_idx, batch_start in enumerate(range(0, len(split_df), batch_size)):
-            batch_df = split_df.iloc[batch_start:batch_start + batch_size]
+        if 'timestamp' not in df.columns:
+            raise ValueError("Metadata file must contain a 'timestamp' column")
+            
+        logger.info("Original timestamp samples:")
+        logger.info(df['timestamp'].head())
+        
+        df['timestamp'] = df['timestamp'].apply(cls.standardize_timestamp)
+        df = df.dropna(subset=['timestamp'])
+        
+        logger.info("Cleaned timestamp samples:")
+        logger.info(df['timestamp'].head())
+        
+        if output_path:
+            df.to_csv(output_path, index=False)
+            logger.info(f"Saved cleaned metadata to {output_path}")
+            
+        return df
+
+class GraphConverter:
+    """Convert graph structures to PyTorch Geometric format."""
+    
+    @staticmethod
+    def convert_to_pytorch_geometric(graph_structure: Dict) -> Data:
+        """Convert graph structure to PyG format with error handling."""
+        try:
+            # Extract feature keys
+            feature_keys = sorted(list({
+                key for node in graph_structure['node_features'] 
+                for key in node.keys() if key != 'id'  # Exclude id from features
+            }))
+            
+            # Create feature vectors
+            node_feats = []
+            for node in graph_structure['node_features']:
+                feats = [
+                    float(node.get(key, 0)) if not isinstance(node.get(key), bool)
+                    else float(node.get(key, False))
+                    for key in feature_keys
+                ]
+                node_feats.append(feats)
+            
+            # Convert to tensors with proper error handling
+            x = torch.tensor(node_feats, dtype=torch.float) if node_feats else \
+                torch.zeros((len(graph_structure['node_features']), len(feature_keys)), dtype=torch.float)
+            
+            edge_index = torch.tensor(graph_structure['edge_index'], dtype=torch.long).t() \
+                if graph_structure['edge_index'] else torch.zeros((2, 0), dtype=torch.long)
+            
+            # Handle edge features if present
+            edge_attr = None
+            if graph_structure.get('edge_features'):
+                edge_feats = [[float(edge.get('condition', False) is not None)] 
+                             for edge in graph_structure['edge_features']]
+                edge_attr = torch.tensor(edge_feats, dtype=torch.float)
+            
+            data = Data(x=x, edge_index=edge_index, edge_attr=edge_attr)
+            data.num_nodes = x.size(0)
+            return data
+            
+        except Exception as e:
+            logger.error(f"Error converting graph structure: {str(e)}")
+            raise
+
+class DatasetProcessor:
+    """Process and batch the dataset."""
+    
+    def __init__(self, 
+                 metadata_path: str,
+                 data_dir: str,
+                 output_dir: str,
+                 batch_size: int = 100,
+                 train_ratio: float = 0.7,
+                 val_ratio: float = 0.15):
+        self.metadata_path = metadata_path
+        self.data_dir = Path(data_dir)
+        self.output_dir = Path(output_dir)
+        self.batch_size = batch_size
+        self.train_ratio = train_ratio
+        self.val_ratio = val_ratio
+        self.graph_converter = GraphConverter()
+    
+    def process(self):
+        """Process the complete dataset."""
+        # Clean metadata
+        df = TimestampCleaner.clean_metadata_timestamps(self.metadata_path)
+        
+        # Sort by timestamp
+        df = df.sort_values('timestamp')
+        logger.info(f"Processing {len(df)} samples")
+        
+        # Create splits
+        n_train = int(len(df) * self.train_ratio)
+        n_val = int(len(df) * self.val_ratio)
+        splits = {
+            'train': df.iloc[:n_train],
+            'val': df.iloc[n_train:n_train + n_val],
+            'test': df.iloc[n_train + n_val:]
+        }
+        
+        # Process each split
+        total_processed = 0
+        for split_name, split_df in splits.items():
+            logger.info(f"\nProcessing {split_name} split ({len(split_df)} samples)")
+            split_dir = self.output_dir / split_name
+            split_dir.mkdir(parents=True, exist_ok=True)
+            
+            processed = self._process_split(split_df, split_dir)
+            total_processed += processed
+            
+        logger.info(f"\nTotal processed graphs: {total_processed}")
+        return total_processed
+    
+    def _process_split(self, split_df: pd.DataFrame, split_dir: Path) -> int:
+        """Process a single data split."""
+        processed_count = 0
+        
+        # Process in batches
+        for batch_idx, batch_start in enumerate(range(0, len(split_df), self.batch_size)):
+            batch_df = split_df.iloc[batch_start:batch_start + self.batch_size]
             batch_graphs = []
-            files_found = 0
-            files_not_found = 0
             
-            for _, row in batch_df.iterrows():
-                filepath = os.path.join(results_dir, row['filename'])
-                if os.path.exists(filepath):
-                    try:
-                        with gzip.open(filepath, 'rt') as f:
-                            data = json.load(f)
-                            graph = convert_to_pytorch_geometric(data['graph_structure'])
-                            graph.sha = row['sha']
-                            graph.timestamp = row['timestamp']
-                            if pd.notna(row['family']):
-                                graph.family = row['family']
-                            batch_graphs.append(graph)
-                            files_found += 1
-                    except Exception as e:
-                        print(f"Error processing {row['filename']}: {str(e)}")
-                else:
-                    files_not_found += 1
-                    if files_not_found <= 5:  # Only show first 5 missing files
-                        print(f"File not found: {row['filename']} (SHA: {row['sha']})")
+            # Process each file in the batch
+            for _, row in tqdm(batch_df.iterrows(), total=len(batch_df), 
+                             desc=f"Processing batch {batch_idx + 1}"):
+                try:
+                    filepath = self.data_dir / f"{row['sha']}.json.gz"
+                    
+                    if not filepath.exists():
+                        logger.warning(f"File not found: {filepath}")
+                        continue
+                    
+                    with gzip.open(filepath, 'rt') as f:
+                        data = json.load(f)
+                        graph = self.graph_converter.convert_to_pytorch_geometric(data['graph_structure'])
+                        
+                        # Add metadata
+                        graph.sha = row['sha']
+                        graph.timestamp = row['timestamp']
+                        if pd.notna(row.get('family')):
+                            graph.family = row['family']
+                            
+                        batch_graphs.append(graph)
+                        
+                except Exception as e:
+                    logger.error(f"Error processing {filepath}: {str(e)}")
+                    continue
             
-            print(f"\nBatch {batch_idx + 1}:")
-            print(f"Files found: {files_found}")
-            print(f"Files not found: {files_not_found}")
-            
+            # Save batch if not empty
             if batch_graphs:
-                batch_file = f'bodmas_batches/{split_name}/batch_{batch_idx:04d}.pt'
+                batch_file = split_dir / f"batch_{batch_idx:04d}.pt"
                 torch.save(batch_graphs, batch_file)
-                split_graphs += len(batch_graphs)
-                print(f"Saved {len(batch_graphs)} graphs to {batch_file}")
-                print(f"Time range: {batch_df['timestamp'].min()} to {batch_df['timestamp'].max()}")
-        
-        print(f"Total graphs saved for {split_name}: {split_graphs}")
-        total_graphs += split_graphs
-    
-    print(f"\nTotal graphs saved: {total_graphs}")
+                processed_count += len(batch_graphs)
+                
+                logger.info(f"Saved {len(batch_graphs)} graphs to {batch_file}")
+                logger.info(f"Time range: {batch_df['timestamp'].min()} to {batch_df['timestamp'].max()}")
+            
+        return processed_count
 
 def main():
-    # First clean timestamps
-    cleaned_csv = clean_timestamps('bodmas_metadata.csv')
+    processor = DatasetProcessor(
+        metadata_path='bodmas_metadata_cleaned.csv',
+        data_dir='cfg_analysis_results_test',#'cfg_analysis_results',
+        output_dir='bodmas_batches_test',
+        batch_size=100,
+        train_ratio=0.7,
+        val_ratio=0.15
+    )           
     
-    # Then process using cleaned metadata
-    process_dataset(
-        metadata_csv=cleaned_csv,
-        results_dir='cfg_analysis_results'
-    )
+    processor.process()
 
 if __name__ == "__main__":
     main()

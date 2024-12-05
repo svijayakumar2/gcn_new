@@ -286,14 +286,30 @@ class ParallelBAPProcessor:
                 edge_index.append([node_mapping[src], node_mapping[dst]])
                 edge_features.append({'condition': data.get('condition', None)})
             
-            # Create node features efficiently
+            # Create node features with consistent feature set
             node_features = []
             for node in G.nodes():
                 node_data = G.nodes[node]
-                features = {}
+                # Initialize all features to 0
+                features = {
+                    'mem_ops': 0,
+                    'calls': 0,
+                    'instructions': 0,
+                    'stack_ops': 0,
+                    'reg_writes': 0,
+                    'external_calls': 0,
+                    'internal_calls': 0,
+                    'mem_reads': 0,
+                    'mem_writes': 0,
+                    'in_degree': 0,
+                    'out_degree': 0,
+                    'is_conditional': 0,
+                    'has_jump': 0,
+                    'has_ret': 0
+                }
                 
-                # Only add features that aren't zero/false
-                counts = {
+                # Update with actual values
+                features.update({
                     'mem_ops': len(node_data.get('mem_ops', [])),
                     'calls': len(node_data.get('calls', [])),
                     'instructions': len(node_data.get('instructions', [])),
@@ -310,26 +326,21 @@ class ParallelBAPProcessor:
                     'mem_writes': sum(1 for op in node_data.get('mem_ops', []) 
                                     if 'mem with' in op),
                     'in_degree': G.in_degree(node),
-                    'out_degree': G.out_degree(node)
-                }
-                features.update({k: v for k, v in counts.items() if v != 0})
+                    'out_degree': G.out_degree(node),
+                    'is_conditional': int(any('CF' in instr or 'ZF' in instr 
+                                        for instr in node_data.get('instructions', []))),
+                    'has_jump': int(any('jmp' in instr.lower() 
+                                    for instr in node_data.get('instructions', []))),
+                    'has_ret': int(any('ret' in instr.lower() 
+                                    for instr in node_data.get('instructions', [])))
+                })
                 
-                # Boolean features only if true
-                if any('CF' in instr or 'ZF' in instr for instr in node_data.get('instructions', [])):
-                    features['is_conditional'] = True
-                if any('jmp' in instr.lower() for instr in node_data.get('instructions', [])):
-                    features['has_jump'] = True
-                if any('ret' in instr.lower() for instr in node_data.get('instructions', [])):
-                    features['has_ret'] = True
-                    
                 node_features.append(features)
 
             # Save with compression
             print(f"Processing {cfg_file}")
             filename = cfg_file.rsplit('/', 1)[-1]
-            # Extract the part before the first underscore
             hash_part = filename.split('_')[0]
-
             print(hash_part)
 
             output_file = os.path.join(self.output_path, f"{hash_part}.json.gz")
@@ -347,7 +358,6 @@ class ParallelBAPProcessor:
                 'timestamp': datetime.datetime.now().isoformat()
             }
             
-            import gzip
             with gzip.open(output_file, 'wt') as f:
                 json.dump(data, f, separators=(',', ':'))
 
