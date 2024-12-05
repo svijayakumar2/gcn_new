@@ -10,6 +10,7 @@ from datetime import datetime
 from torch_geometric.data import DataLoader
 from sklearn.metrics import classification_report
 import numpy as np
+from architectures import CentroidLayer, MalwareGNN
 
 logging.basicConfig(
     level=logging.INFO,
@@ -17,80 +18,36 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-class CentroidLayer(torch.nn.Module):
-    def __init__(self, input_dim, n_classes, n_centroids_per_class=3):
-        super().__init__()
-        self.input_dim = input_dim
-        self.n_classes = n_classes
-        self.n_centroids_per_class = n_centroids_per_class
+# class CentroidLayer(torch.nn.Module):
+#     def __init__(self, input_dim, n_classes, n_centroids_per_class=3):
+#         super().__init__()
+#         self.input_dim = input_dim
+#         self.n_classes = n_classes
+#         self.n_centroids_per_class = n_centroids_per_class
         
-        # Initialize centroids
-        n_total_centroids = n_classes * n_centroids_per_class
-        self.centroids = torch.nn.Parameter(
-            torch.randn(n_total_centroids, input_dim) / np.sqrt(input_dim)
-        )
+#         # Initialize centroids
+#         n_total_centroids = n_classes * n_centroids_per_class
+#         self.centroids = torch.nn.Parameter(
+#             torch.randn(n_total_centroids, input_dim) / np.sqrt(input_dim)
+#         )
         
-    def forward(self, x):
-        # Compute distances to all centroids
-        expanded_x = x.unsqueeze(1)
-        expanded_centroids = self.centroids.unsqueeze(0)
+#     def forward(self, x):
+#         # Compute distances to all centroids
+#         expanded_x = x.unsqueeze(1)
+#         expanded_centroids = self.centroids.unsqueeze(0)
         
-        # Compute euclidean distances
-        distances = torch.norm(expanded_x - expanded_centroids, dim=2)
+#         # Compute euclidean distances
+#         distances = torch.norm(expanded_x - expanded_centroids, dim=2)
         
-        # Reshape distances to group by class
-        distances = distances.view(x.size(0), self.n_classes, self.n_centroids_per_class)
+#         # Reshape distances to group by class
+#         distances = distances.view(x.size(0), self.n_classes, self.n_centroids_per_class)
         
-        # Get minimum distance to each class's centroids
-        min_distances, _ = torch.min(distances, dim=2)
+#         # Get minimum distance to each class's centroids
+#         min_distances, _ = torch.min(distances, dim=2)
         
-        # Convert distances to logits
-        return -min_distances
+#         # Convert distances to logits
+#         return -min_distances
 
-class MalwareGNN(torch.nn.Module):
-    def __init__(self, num_node_features, num_classes, hidden_dim=64):
-        super().__init__()
-        self.num_classes = num_classes
-        
-        # GNN layers
-        self.conv1 = GCNConv(num_node_features, hidden_dim)
-        self.conv2 = GCNConv(hidden_dim, hidden_dim)
-        self.conv3 = GCNConv(hidden_dim, hidden_dim)
-        
-        # Batch normalization layers
-        self.bn1 = torch.nn.BatchNorm1d(hidden_dim)
-        self.bn2 = torch.nn.BatchNorm1d(hidden_dim)
-        self.bn3 = torch.nn.BatchNorm1d(hidden_dim)
-        
-        # Centroid layer
-        self.centroid = CentroidLayer(
-            input_dim=hidden_dim,
-            n_classes=num_classes,
-            n_centroids_per_class=3
-        )
-    
-    def get_embedding(self, data):
-        x, edge_index, batch = data.x, data.edge_index, data.batch
-        
-        x = self.conv1(x, edge_index)
-        x = self.bn1(x)
-        x = F.relu(x)
-        x = F.dropout(x, p=0.2, training=self.training)
-        
-        x = self.conv2(x, edge_index)
-        x = self.bn2(x)
-        x = F.relu(x)
-        x = F.dropout(x, p=0.2, training=self.training)
-        
-        x = self.conv3(x, edge_index)
-        x = self.bn3(x)
-        
-        x = global_mean_pool(x, batch)
-        return x
-    
-    def forward(self, data):
-        embedding = self.get_embedding(data)
-        return self.centroid(embedding)
 
 def prepare_data(base_dir='bodmas_batches_test'):
     """Prepare datasets with temporal ordering."""

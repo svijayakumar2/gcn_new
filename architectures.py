@@ -6,165 +6,495 @@ from torch_geometric.nn import GCNConv
 from torch_geometric.nn import global_mean_pool, global_max_pool
 import numpy as np
 from torch_geometric.nn import BatchNorm
+import logging
+# logger
+import os 
+logger = logging.getLogger(__name__)
+import sys 
+from collections import defaultdict
 
 
-# # -
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch_geometric.nn import GCNConv, global_mean_pool
 
-# class CentroidLayer(torch.nn.Module):
-#   def __init__(self, input_dim, n_classes, n_centroids_per_class=None, ac_std_lim=5.0, reject_input=False, **kwargs):
 
-#     super().__init__(**kwargs)
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch_geometric.nn import GCNConv, global_mean_pool
+import numpy as np
+from collections import defaultdict
+import logging
 
-#     self.n_classes = n_classes
-#     self.n = n_centroids_per_class or 1
-#     self.input_dim = int(input_dim)
+logger = logging.getLogger(__name__)
+
+
+
+# class NoveltyEvaluator:
+#     """Evaluate model performance including goodware detection."""
+#     def __init__(self, known_families):
+#         self.known_families = set(known_families)
+#         self.results = {
+#             'true_positives': 0,  # Correctly identified new malware families
+#             'false_positives': 0,  # Known malware/goodware marked as new
+#             'true_negatives': 0,  # Known samples correctly classified
+#             'false_negatives': 0,  # New families missed
+#             'goodware_correct': 0,  # Correctly identified goodware
+#             'goodware_incorrect': 0,  # Goodware misclassified as malware
+#             'malware_as_goodware': 0,  # Malware misclassified as goodware
+#             'novel_families_found': set(),
+#             'misclassified_known': defaultdict(int)
+#         }
     
-#     self.centroids = torch.nn.Parameter(torch.randn(self.n_classes, self.n, self.input_dim))
-#     self.std_scale = torch.nn.Parameter(torch.tensor(1.0))
-#     self.ac_temp = torch.nn.Parameter(torch.tensor(1.0))
-
-#     running_mean = torch.tensor(torch.tensor(1.0))
-#     running_var = torch.tensor(torch.tensor(0.0))
-#     ac_std_lim = torch.tensor(torch.tensor(ac_std_lim))
+#     def update(self, predictions, true_families):
+#         """Update metrics including goodware classification."""
+#         for pred, true_family in zip(predictions, true_families):
+#             is_actually_goodware = true_family in ['none', 'goodware']
+#             is_actually_new = not is_actually_goodware and true_family not in self.known_families
+            
+#             was_flagged_goodware = pred['is_goodware'].item()
+#             was_flagged_new = pred['is_novel'].item()
+            
+#             if is_actually_goodware:
+#                 if was_flagged_goodware:
+#                     self.results['goodware_correct'] += 1
+#                 else:
+#                     self.results['goodware_incorrect'] += 1
+#             else:  # Malware sample
+#                 if was_flagged_goodware:
+#                     self.results['malware_as_goodware'] += 1
+#                 elif is_actually_new:
+#                     if was_flagged_new:
+#                         self.results['true_positives'] += 1
+#                         self.results['novel_families_found'].add(true_family)
+#                     else:
+#                         self.results['false_negatives'] += 1
+#                 else:
+#                     if was_flagged_new:
+#                         self.results['false_positives'] += 1
+#                         self.results['misclassified_known'][true_family] += 1
+#                     else:
+#                         self.results['true_negatives'] += 1
     
-#     self.register_buffer('running_mean', running_mean)
-#     self.register_buffer('running_var', running_var)
-#     self.register_buffer('ac_std_lim', ac_std_lim)
-
-#     self.reject_input = reject_input
-#     self.relu = torch.nn.ReLU()
-  
-#   def forward(self, x):
-
-#       # This has shape (batch_size, n_classes, centroids_per_class)
-#       # Note: the [None] notation adds an extra dimension that we can
-#       #    broadcast over.
-
-#       dist_to_centroids = torch.sqrt(
-#           torch.sum((self.centroids[None] - x[:, None, None])**2,
-#                         dim=-1))
-
-#       # This is the min distance to class centroids and has shape (batch_size, n_classes).
-#       dist, _ = torch.min(dist_to_centroids, dim=2)
-#       y = -dist
-
-#       if self.reject_input:
-
-#         if self.training:
-#           mean_dist = torch.mean(torch.min(dist, dim=1)[0]).detach()
-#           var_dist = torch.var(torch.min(dist, dim=1)[0]).detach()
-#           self.running_mean = self.running_mean * 0.9 + mean_dist * 0.1
-#           self.running_var = self.running_var * 0.9 + var_dist * 0.1
-
-#         max_ac_dist = self.running_mean + torch.clip(self.relu(self.std_scale), min=0., max=self.ac_std_lim) * torch.sqrt(self.running_var)
-
-#         # we accept if the distance is smaller than the max_ac_dist
-#         # that is, if max_ac_dist - dist > 0, accept(x) = 1
-#         accept_score = max_ac_dist - torch.min(dist, dim=1, keepdims=True)[0].detach()
-#         soft_accept_score = accept_score / self.ac_temp
-#         soft_accept_score = soft_accept_score.sigmoid()
-
-
-#         return torch.cat([y, soft_accept_score], dim=1)
-
-#       return y
-
-class CentroidLayer(torch.nn.Module):
-    """
-    Neurosymbolic centroid-based classification layer.
-    Instead of learning a linear transformation, it learns prototype vectors (centroids)
-    for each class and classifies based on distance to these prototypes.
-    """
-    def __init__(self, input_dim, n_classes, n_centroids_per_class=3, distance_temp=10.0):
-        super().__init__()
-        self.input_dim = input_dim
-        self.n_classes = n_classes
-        self.n_centroids_per_class = n_centroids_per_class
-        self.distance_temp = distance_temp  # Temperature for softening distance calculations
+#     def get_metrics(self):
+#         """Calculate comprehensive metrics."""
+#         # Novelty detection metrics
+#         tp = self.results['true_positives']
+#         fp = self.results['false_positives']
+#         tn = self.results['true_negatives']
+#         fn = self.results['false_negatives']
         
-        # Initialize centroids matrix: (n_classes * n_centroids_per_class, input_dim)
-        # Each class gets multiple centroids to capture different variations
-        self.centroids = torch.nn.Parameter(
-            torch.randn(n_classes * n_centroids_per_class, input_dim) / np.sqrt(input_dim)
+#         # Goodware classification metrics
+#         gc = self.results['goodware_correct']
+#         gi = self.results['goodware_incorrect']
+#         mg = self.results['malware_as_goodware']
+        
+#         novelty_metrics = {
+#             'novelty_precision': tp / (tp + fp) if (tp + fp) > 0 else 0,
+#             'novelty_recall': tp / (tp + fn) if (tp + fn) > 0 else 0,
+#             'novel_families_found': list(self.results['novel_families_found'])
+#         }
+        
+#         goodware_metrics = {
+#             'goodware_accuracy': gc / (gc + gi) if (gc + gi) > 0 else 0,
+#             'goodware_false_positive_rate': mg / (mg + tn) if (mg + tn) > 0 else 0,
+#         }
+        
+#         return {
+#             **novelty_metrics,
+#             **goodware_metrics,
+#             'most_confused_known': dict(sorted(
+#                 self.results['misclassified_known'].items(),
+#                 key=lambda x: x[1],
+#                 reverse=True
+#             )[:5])
+#         }
+
+class PhasedGNN(nn.Module):
+    def __init__(self, num_node_features: int, num_families: int, hidden_dim: int = 64):
+        super().__init__()
+        self.num_families = num_families
+        
+        # GNN layers
+        self.conv1 = GCNConv(num_node_features, hidden_dim)
+        self.conv2 = GCNConv(hidden_dim, hidden_dim)
+        self.conv3 = GCNConv(hidden_dim, hidden_dim)
+        
+        # Batch normalization
+        self.bn1 = nn.BatchNorm1d(hidden_dim)
+        self.bn2 = nn.BatchNorm1d(hidden_dim)
+        self.bn3 = nn.BatchNorm1d(hidden_dim)
+
+        # Centroid-based classification
+        self.centroid_layer = CentroidClassifier(
+            hidden_dim,
+            num_families,
+            goodware_centroids=5,
+            centroids_per_family=3
         )
         
-    def forward(self, x):
-        """
-        Args:
-            x: Input embeddings of shape (batch_size, input_dim)
-        Returns:
-            logits: Classification logits of shape (batch_size, n_classes)
-        """
+        self.current_phase = 'family'  # ['family', 'goodware', 'novelty']
+
+    def encode(self, x, edge_index, batch):
+        """Get graph embeddings"""
+        x = F.relu(self.bn1(self.conv1(x, edge_index)))
+        x = F.dropout(x, p=0.2, training=self.training)
+        
+        x = F.relu(self.bn2(self.conv2(x, edge_index)))
+        x = F.dropout(x, p=0.2, training=self.training)
+        
+        x = self.bn3(self.conv3(x, edge_index))
+        
+        # Global pooling
+        graph_embedding = global_mean_pool(x, batch)
+        return graph_embedding
+
+    def forward(self, data):
+        # Get graph embeddings
+        embeddings = self.encode(data.x, data.edge_index, data.batch)
+        
+        # Get predictions based on current phase
+        if self.current_phase == 'family':
+            # Regular family classification
+            logits = self.centroid_layer(embeddings)
+            return logits
+            
+        elif self.current_phase == 'goodware':
+            # Binary goodware vs malware classification
+            logits = self.centroid_layer(embeddings)
+            goodware_logits = logits[:, 0]  # First centroid is goodware
+            malware_logits = torch.logsumexp(logits[:, 1:], dim=1)  # Combine all malware families
+            return torch.stack([goodware_logits, malware_logits], dim=1)
+            
+        else:  # novelty phase
+            # Full classification plus novelty detection
+            logits, novelty_scores = self.centroid_layer(embeddings, return_novelty=True)
+            return logits, novelty_scores
+
+    def set_phase(self, phase):
+        assert phase in ['family', 'goodware', 'novelty']
+        self.current_phase = phase
+
+class CentroidClassifier(nn.Module):
+    def __init__(self, embed_dim, num_families, goodware_centroids=5, centroids_per_family=3):
+        super().__init__()
+        
+        self.embed_dim = embed_dim
+        self.num_families = num_families
+        self.centroids_per_family = centroids_per_family
+        
+        # Initialize centroids for malware families
+        self.malware_centroids = nn.Parameter(
+            torch.randn(num_families * centroids_per_family, embed_dim) / np.sqrt(embed_dim)
+        )
+        
+        # Separate centroids for goodware
+        self.goodware_centroids = nn.Parameter(
+            torch.randn(goodware_centroids, embed_dim) / np.sqrt(embed_dim)
+        )
+        
+        # Learnable temperature
+        self.temperature = nn.Parameter(torch.tensor([1.0]))
+        
+        # Learnable novelty threshold
+        self.novelty_threshold = nn.Parameter(torch.tensor([10.0]))
+
+    def forward(self, x, return_novelty=False):
         batch_size = x.size(0)
         
-        # Compute pairwise distances between inputs and all centroids
-        # Expand dimensions to enable broadcasting
-        expanded_x = x.unsqueeze(1)  # (batch_size, 1, input_dim)
-        expanded_centroids = self.centroids.unsqueeze(0)  # (1, n_classes * n_centroids, input_dim)
+        # Calculate distances
+        goodware_dists = self._compute_distances(x, self.goodware_centroids)
+        malware_dists = self._compute_distances(x, self.malware_centroids)
         
-        # Compute squared Euclidean distance
-        squared_diff = (expanded_x - expanded_centroids) ** 2  # (batch_size, n_classes * n_centroids, input_dim)
-        distances = torch.sum(squared_diff, dim=2)  # (batch_size, n_classes * n_centroids)
+        # Reshape malware distances by family
+        malware_dists = malware_dists.view(
+            batch_size, self.num_families, self.centroids_per_family
+        )
         
-        # Reshape distances to group centroids by class
-        distances = distances.view(batch_size, self.n_classes, self.n_centroids_per_class)
+        # Get minimum distance to each family
+        min_goodware_dist = goodware_dists.min(dim=1)[0]
+        min_malware_dists = malware_dists.min(dim=2)[0]
         
-        # For each class, use the minimum distance to any of its centroids
-        # This implements a "closest prototype" rule per class
-        min_class_distances, _ = torch.min(distances, dim=2)  # (batch_size, n_classes)
+        # Convert distances to logits
+        goodware_logits = -min_goodware_dist / self.temperature
+        malware_logits = -min_malware_dists / self.temperature
         
-        # Convert distances to logits using negative distance and temperature
-        # Lower distance = higher logit
-        logits = -min_class_distances / self.distance_temp
+        # Combine logits
+        logits = torch.cat([
+            goodware_logits.unsqueeze(1),
+            malware_logits
+        ], dim=1)
         
+        if return_novelty:
+            # Calculate novelty scores
+            all_dists = torch.cat([min_goodware_dist.unsqueeze(1), min_malware_dists], dim=1)
+            min_dists = all_dists.min(dim=1)[0]
+            novelty_scores = min_dists / self.novelty_threshold
+            return logits, novelty_scores
+            
         return logits
-    
-    def get_centroids_by_class(self):
-        """
-        Returns the centroids grouped by class for interpretation.
-        """
-        return self.centroids.view(self.n_classes, self.n_centroids_per_class, self.input_dim)
-    
-    def get_nearest_training_samples(self, embeddings, labels, k=5):
-        """
-        Find training samples closest to each centroid for interpretation.
+
+    def _compute_distances(self, x, centroids):
+        """Compute squared Euclidean distances between samples and centroids"""
+        x_expanded = x.unsqueeze(1)
+        centroids_expanded = centroids.unsqueeze(0)
+        return torch.sum((x_expanded - centroids_expanded) ** 2, dim=2)
+
+class PhasedTraining:
+    def __init__(self, model, device, lr=0.001):
+        self.model = model
+        self.device = device
+        self.optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+
+    def train_batch(self, batch, phase):
+        self.model.train()
+        self.model.set_phase(phase)
+        self.optimizer.zero_grad()
         
-        Args:
-            embeddings: Training sample embeddings (n_samples, input_dim)
-            labels: True labels for training samples (n_samples,)
-            k: Number of nearest neighbors to return per centroid
-        Returns:
-            Dictionary mapping (class_idx, centroid_idx) to list of k nearest sample indices
-        """
-        nearest_samples = {}
-        
-        # For each class and its centroids
-        for class_idx in range(self.n_classes):
-            class_mask = (labels == class_idx)
-            if not torch.any(class_mask):
-                continue
-                
-            class_embeddings = embeddings[class_mask]
-            class_indices = torch.where(class_mask)[0]
+        if phase == 'family':
+            # Standard family classification
+            logits = self.model(batch)
+            loss = F.cross_entropy(logits, batch.y)
             
-            # Get this class's centroids
-            start_idx = class_idx * self.n_centroids_per_class
-            end_idx = start_idx + self.n_centroids_per_class
-            class_centroids = self.centroids[start_idx:end_idx]
+        elif phase == 'goodware':
+            # Binary classification
+            logits = self.model(batch)
+            is_goodware = (batch.y == 0).float()
+            loss = F.binary_cross_entropy_with_logits(logits[:, 0], is_goodware)
             
-            # For each centroid of this class
-            for centroid_idx, centroid in enumerate(class_centroids):
-                # Compute distances to all samples of this class
-                distances = torch.norm(class_embeddings - centroid.unsqueeze(0), dim=1)
-                
-                # Get k nearest samples
-                k_distances, k_indices = torch.topk(distances, min(k, len(distances)), largest=False)
-                nearest_samples[(class_idx, centroid_idx)] = {
-                    'indices': class_indices[k_indices].cpu().numpy(),
-                    'distances': k_distances.cpu().numpy()
-                }
+        else:  # novelty phase
+            logits, novelty_scores = self.model(batch)
+            # Classification loss
+            ce_loss = F.cross_entropy(logits, batch.y)
+            # Novelty loss
+            is_novel = (batch.y >= self.model.num_families).float()
+            novelty_loss = F.binary_cross_entropy_with_logits(novelty_scores, is_novel)
+            loss = ce_loss + novelty_loss
         
-        return nearest_samples
+        loss.backward()
+        self.optimizer.step()
+        return loss.item()
+
+    @torch.no_grad()
+    def evaluate(self, batch, phase):
+        self.model.eval()
+        self.model.set_phase(phase)
+        
+        if phase == 'family':
+            logits = self.model(batch)
+            preds = logits.argmax(dim=1)
+            correct = (preds == batch.y).sum().item()
+            
+        elif phase == 'goodware':
+            logits = self.model(batch)
+            is_goodware = (batch.y == 0).bool()
+            preds = logits[:, 0] > 0
+            correct = (preds == is_goodware).sum().item()
+            
+        else:  # novelty
+            logits, novelty_scores = self.model(batch)
+            preds = logits.argmax(dim=1)
+            is_novel = novelty_scores > 0.5
+            
+            # Count as correct if:
+            # - Correctly identified as novel, or
+            # - Correctly classified as a known family when not novel
+            novel_mask = batch.y >= self.model.num_families
+            correct = (
+                (is_novel & novel_mask) | 
+                (~is_novel & ~novel_mask & (preds == batch.y))
+            ).sum().item()
+        
+        return correct, batch.y.size(0)
+    
+
+# sys.exit(0) 
+# class PhasedTraining:
+#     """Handles phased training for malware GNN"""
+#     def __init__(self, model, device, phases=['basic', 'goodware', 'novelty'], epochs_per_phase=30):
+#         self.model = model
+#         self.device = device
+#         self.phases = phases
+#         self.epochs_per_phase = epochs_per_phase
+#         self.optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+        
+#         # Map phase names to functions
+#         self.phase_functions = {
+#             'basic': self._train_basic,
+#             'goodware': self._train_goodware,
+#             'novelty': self._train_novelty
+#         }
+        
+#     def train_batch(self, phase, batch):
+#         """Train a single batch using the appropriate phase function"""
+#         self.model.train()
+#         loss = self.phase_functions[phase](batch)
+        
+#         self.optimizer.zero_grad()
+#         loss.backward()
+#         self.optimizer.step()
+        
+#         return loss.item()
+        
+#     def validate_batch(self, phase, batch):
+#         """Validate a single batch"""
+#         self.model.eval()
+#         with torch.no_grad():
+#             if phase == 'basic':
+#                 # Basic family classification
+#                 logits = self.model(batch)
+#                 pred = logits.argmax(dim=1)
+#                 correct = (pred == batch.y).sum().item()
+#                 return correct, batch.y.size(0)
+                
+#             elif phase == 'goodware':
+#                 # Binary goodware vs malware
+#                 logits = self.model(batch)
+#                 pred = (F.softmax(logits, dim=1)[:, 0] > 0.5).float()  # goodware probability
+#                 is_goodware = (batch.y == 0).float()
+#                 correct = (pred == is_goodware).sum().item()
+#                 return correct, batch.y.size(0)
+                
+#             else:  # novelty phase
+#                 logits, distances = self.model(batch)
+#                 predictions = self.model.centroid.predict_with_novelty(
+#                     self.model.get_embedding(batch)
+#                 )
+#                 # Consider prediction correct if:
+#                 # - Correctly identified as novel
+#                 # - OR correctly classified if not novel
+#                 novel_mask = batch.y >= self.model.num_classes - 1
+#                 correct = ((predictions['is_novel'] & novel_mask) | 
+#                           ((~predictions['is_novel']) & (~novel_mask) & 
+#                            (predictions['predictions'] == batch.y))).sum().item()
+#                 return correct, batch.y.size(0)
+
+#     def _train_basic(self, batch):
+#         """Basic malware family classification"""
+#         logits = self.model(batch)
+#         return F.cross_entropy(logits, batch.y)
+        
+#     def _train_goodware(self, batch):
+#         """Train to distinguish goodware vs malware"""
+#         logits = self.model(batch)
+#         is_goodware = (batch.y == 0).float()
+#         return F.binary_cross_entropy_with_logits(
+#             logits[:, 0],  # goodware logit
+#             is_goodware
+#         )
+        
+#     def _train_novelty(self, batch):
+#         """Train with novelty detection"""
+#         logits, distances = self.model(batch)
+#         # Regular classification loss
+#         classification_loss = F.cross_entropy(logits, batch.y)
+        
+#         # Novelty detection loss
+#         predictions = self.model.centroid.predict_with_novelty(
+#             self.model.get_embedding(batch)
+#         )
+#         novel_mask = (batch.y >= self.model.num_classes - 1).float()
+#         novelty_loss = F.binary_cross_entropy(
+#             predictions['novelty_scores'],
+#             novel_mask
+#         )
+        
+#         return classification_loss + novelty_loss
+    
+# class CentroidLayer(torch.nn.Module):
+#     def __init__(self, input_dim, n_classes, n_centroids_per_class=3, 
+#                  goodware_centroids=5, temperature=1.0, novelty_threshold=None):
+#         super().__init__()
+#         self.input_dim = input_dim
+#         self.n_classes = n_classes  # Total number of classes including goodware
+#         self.n_malware_classes = n_classes - 1  # Number of malware classes
+#         self.n_centroids_per_class = n_centroids_per_class
+#         self.goodware_centroids = goodware_centroids
+#         self.temperature = temperature
+        
+#         # Initialize centroids for malware families (n_classes - 1 because one class is goodware)
+#         self.malware_centroids = torch.nn.Parameter(
+#             torch.randn(self.n_malware_classes * n_centroids_per_class, input_dim) / np.sqrt(input_dim)
+#         )
+        
+#         # Separate centroids for goodware
+#         self.goodware_centroids_param = torch.nn.Parameter(
+#             torch.randn(goodware_centroids, input_dim) / np.sqrt(input_dim)
+#         )
+        
+#         if novelty_threshold is None:
+#             self.register_buffer('novelty_threshold', torch.tensor(float('inf')))
+#         else:
+#             self.register_buffer('novelty_threshold', torch.tensor(novelty_threshold))
+    
+#     def forward(self, x, return_distances=False):
+#         batch_size = x.size(0)
+        
+#         # Expand dimensions for broadcasting
+#         expanded_x = x.unsqueeze(1)  # [batch_size, 1, input_dim]
+#         expanded_malware_centroids = self.malware_centroids.unsqueeze(0)  # [1, n_mal_centroids, input_dim]
+#         expanded_goodware_centroids = self.goodware_centroids_param.unsqueeze(0)  # [1, goodware_centroids, input_dim]
+        
+#         # Compute distances
+#         malware_distances = torch.sum((expanded_x - expanded_malware_centroids) ** 2, dim=2)
+#         goodware_distances = torch.sum((expanded_x - expanded_goodware_centroids) ** 2, dim=2)
+        
+#         # Reshape malware distances - now using n_malware_classes
+#         malware_distances = malware_distances.view(batch_size, self.n_malware_classes, self.n_centroids_per_class)
+        
+#         # Get minimum distances
+#         min_malware_distances = torch.min(malware_distances, dim=2)[0]  # [batch_size, n_malware_classes]
+#         min_goodware_distances = torch.min(goodware_distances, dim=1)[0]  # [batch_size]
+        
+#         # Convert to logits
+#         malware_logits = -min_malware_distances / self.temperature
+#         goodware_logits = -min_goodware_distances / self.temperature
+        
+#         # Calculate novelty scores
+#         all_min_distances = torch.cat([
+#             min_goodware_distances.unsqueeze(1),
+#             min_malware_distances
+#         ], dim=1)  # [batch_size, n_classes]
+        
+#         min_overall_distances = torch.min(all_min_distances, dim=1)[0]
+#         novelty_logits = -(min_overall_distances / self.novelty_threshold).unsqueeze(1)
+        
+#         # Combine logits: [goodware, malware_families, novel]
+#         logits = torch.cat([
+#             goodware_logits.unsqueeze(1),  # [batch_size, 1]
+#             malware_logits,                # [batch_size, n_malware_classes]
+#             novelty_logits                 # [batch_size, 1]
+#         ], dim=1)
+        
+#         if return_distances:
+#             return logits, {
+#                 'malware_distances': min_malware_distances,
+#                 'goodware_distances': min_goodware_distances,
+#                 'min_overall_distances': min_overall_distances,
+#                 'novelty_scores': -novelty_logits.squeeze(1)
+#             }
+        
+#         return logits
+    
+#     def predict_with_novelty(self, x):
+#         """Make predictions including goodware and novelty detection."""
+#         logits, distances = self.forward(x, return_distances=True)
+#         predictions = logits.argmax(dim=1)
+#         novelty_scores = distances['novelty_scores']
+        
+#         is_goodware = predictions == 0
+#         is_novel = (novelty_scores > 1.0) | (predictions == self.n_classes)
+        
+#         return {
+#             'predictions': predictions,
+#             'is_goodware': is_goodware,
+#             'is_novel': is_novel,
+#             'novelty_scores': novelty_scores,
+#             'goodware_confidence': torch.softmax(logits, dim=1)[:, 0],
+#             'distances': distances
+#         }
 
 
 class SimpleGCN(torch.nn.Module):
@@ -338,3 +668,53 @@ class GCNCentroid(torch.nn.Module):
         x = F.dropout(x, p=0.1, training=self.training)
         x = self.centroid(x)
         return x, self.centroid.get_closest_centroid()
+
+
+
+class MalwareGNN(torch.nn.Module):
+    def __init__(self, num_node_features, num_classes, hidden_dim=64):
+        super().__init__()
+        self.num_classes = num_classes
+        
+        # GNN layers
+        self.conv1 = GCNConv(num_node_features, hidden_dim)
+        self.conv2 = GCNConv(hidden_dim, hidden_dim)
+        self.conv3 = GCNConv(hidden_dim, hidden_dim)
+        
+        # Batch normalization layers
+        self.bn1 = torch.nn.BatchNorm1d(hidden_dim)
+        self.bn2 = torch.nn.BatchNorm1d(hidden_dim)
+        self.bn3 = torch.nn.BatchNorm1d(hidden_dim)
+        
+        # Centroid layer
+        self.centroid = CentroidLayer(
+            input_dim=hidden_dim,
+            n_classes=num_classes,
+            n_centroids_per_class=3
+        )
+    
+    def get_embedding(self, data):
+        x, edge_index, batch = data.x, data.edge_index, data.batch
+        
+        x = self.conv1(x, edge_index)
+        x = self.bn1(x)
+        x = F.relu(x)
+        x = F.dropout(x, p=0.2, training=self.training)
+        
+        x = self.conv2(x, edge_index)
+        x = self.bn2(x)
+        x = F.relu(x)
+        x = F.dropout(x, p=0.2, training=self.training)
+        
+        x = self.conv3(x, edge_index)
+        x = self.bn3(x)
+        
+        x = global_mean_pool(x, batch)
+        return x
+    
+    def forward(self, data):
+        embedding = self.get_embedding(data)
+        return self.centroid(embedding)
+    
+
+
