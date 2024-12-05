@@ -137,7 +137,7 @@ class DatasetProcessor:
         # Clean metadata
         df = TimestampCleaner.clean_metadata_timestamps(self.metadata_path)
         
-        # Sort by timestamp
+        # Sort by timestamp -  we want temporal splits, not random
         df = df.sort_values('timestamp')
         logger.info(f"Processing {len(df)} samples")
         
