@@ -212,8 +212,8 @@ class DatasetProcessor:
 def main():
     processor = DatasetProcessor(
         metadata_path='bodmas_metadata_cleaned.csv',
-        data_dir='cfg_analysis_results_test',#'cfg_analysis_results',
-        output_dir='bodmas_batches_test',
+        data_dir='cfg_analysis_results',#'cfg_analysis_results',
+        output_dir='bodmas_batches',
         batch_size=100,
         train_ratio=0.7,
         val_ratio=0.15

@@ -141,20 +141,25 @@ def train_epoch(trainer, split_files, family_to_idx, phase, device):
 
 def evaluate(trainer, split_files, family_to_idx, phase, device):
     """Evaluate on a split."""
-    correct = total = 0
+    total_correct = 0
+    total_preds = 0
+    recall_sum = 0
+    num_batches = 0
     
     for batch_file in split_files:
         loader = load_batch(batch_file, family_to_idx, device=device)
         if not loader:
             continue
-            
         for batch in loader:
-            c, t = trainer.evaluate(batch, phase)
-            correct += c
-            total += t
-            
-    accuracy = correct / max(1, total)
-    return accuracy
+            correct, total, recall = trainer.evaluate(batch, phase)
+            total_correct += correct
+            total_preds += total
+            recall_sum += recall
+            num_batches += 1
+    
+    precision = total_correct / max(1, total_preds)
+    recall = recall_sum / max(1, num_batches)
+    return precision, recall
 
 def main():
     # Setup
@@ -191,10 +196,33 @@ def main():
                              family_to_idx, phase, device)
             
             # Validate
-            accuracy = evaluate(trainer, split_files['val'], 
+            precision, recall  = evaluate(trainer, split_files['val'], 
                               family_to_idx, phase, device)
             
-            logger.info(f"Epoch {epoch}: loss={loss:.4f}, accuracy={accuracy:.4f}")
+            
+            logger.info(f"Epoch {epoch}: loss={loss:.4f}, "
+                        f"precision={precision:.4f}, recall={recall:.4f}")
 
+    save_dir = "trained_model"
+    os.makedirs(save_dir, exist_ok=True)
+    
+    model_path = os.path.join(save_dir, "phased_gnn_final.pt")
+    mapping_path = os.path.join(save_dir, "family_mapping.json")
+    
+    # Save model
+    torch.save({
+        'model_state_dict': model.state_dict(),
+        'num_features': num_features,
+        'num_families': num_families,
+    }, model_path)
+    
+    # Save mapping
+    with open(mapping_path, 'w') as f:
+        json.dump({
+            'family_to_idx': family_to_idx,
+            'idx_to_family': {str(idx): family for family, idx in family_to_idx.items()},
+        }, f, indent=2)
+    
+    logger.info(f"Model and mapping saved to {save_dir}/")
 if __name__ == '__main__':
     main()

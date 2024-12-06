@@ -276,39 +276,52 @@ class PhasedTraining:
         loss.backward()
         self.optimizer.step()
         return loss.item()
-
+        
     @torch.no_grad()
     def evaluate(self, batch, phase):
         self.model.eval()
         self.model.set_phase(phase)
         
         if phase == 'family':
+            # Same as before
             logits = self.model(batch)
             preds = logits.argmax(dim=1)
-            correct = (preds == batch.y).sum().item()
+            precision_correct = (preds == batch.y).sum().item()
+            total_predictions = len(preds)
+            classes = torch.unique(batch.y)
+            recalls = []
+            for c in classes:
+                class_mask = batch.y == c
+                class_total = class_mask.sum().item()
+                class_correct = (preds[class_mask] == c).sum().item()
+                recalls.append(class_correct / class_total if class_total > 0 else 0)
+            return precision_correct, total_predictions, sum(recalls) / len(recalls)
             
         elif phase == 'goodware':
+            # Same as before
             logits = self.model(batch)
             is_goodware = (batch.y == 0).bool()
             preds = logits[:, 0] > 0
-            correct = (preds == is_goodware).sum().item()
+            precision_correct = (preds & is_goodware).sum().item()
+            total_predictions = preds.sum().item()
+            goodware_correct = (preds & is_goodware).sum().item()
+            total_goodware = is_goodware.sum().item()
+            recall = goodware_correct / total_goodware if total_goodware > 0 else 0
+            return precision_correct, total_predictions, recall
             
-        else:  # novelty
-            logits, novelty_scores = self.model(batch)
-            preds = logits.argmax(dim=1)
-            is_novel = novelty_scores > 0.5
+        else:  # novelty phase
+            embeddings = self.model.get_embedding(batch)
+            distances = self.model.get_distances(embeddings)  # Distance to nearest centroid
+            is_novel = distances > self.model.epsilon  # Beyond threshold = novel
             
-            # Count as correct if:
-            # - Correctly identified as novel, or
-            # - Correctly classified as a known family when not novel
-            novel_mask = batch.y >= self.model.num_families
-            correct = (
-                (is_novel & novel_mask) | 
-                (~is_novel & ~novel_mask & (preds == batch.y))
-            ).sum().item()
-        
-        return correct, batch.y.size(0)
-    
+            # Something really is novel if it's outside our known families
+            truly_novel = batch.y >= self.model.num_families
+            
+            precision_correct = (is_novel & truly_novel).sum().item()
+            total_predictions = is_novel.sum().item()
+            recall = precision_correct / truly_novel.sum().item() if truly_novel.sum().item() > 0 else 0
+            
+            return precision_correct, total_predictions, recall
 
 # sys.exit(0) 
 # class PhasedTraining:
