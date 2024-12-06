@@ -15,7 +15,6 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
-
 def prepare_data(base_dir='bodmas_batches_test'):
     """Prepare datasets with temporal ordering."""
     split_files = defaultdict(list)
@@ -51,18 +50,16 @@ def prepare_data(base_dir='bodmas_batches_test'):
             except Exception as e:
                 logger.error(f"Error loading {file}: {str(e)}")
                 continue
-    
-    # Sort splits by timestamp
-    for split in split_files:
-        split_files[split].sort(key=lambda x: file_timestamps.get(x, ''))
-        if split_files[split]:
-            logger.info(f"{split} split: {len(split_files[split])} files "
-                       f"from {file_timestamps[split_files[split][0]]} "
-                       f"to {file_timestamps[split_files[split][-1]]}")
 
+    # Debug prints
+    print("All families found:", all_families)
+    print("Family counts:", family_counts)
+    
     # Create family mapping
     families = sorted(list(all_families))
     family_to_idx = {family: idx for idx, family in enumerate(families)}
+    
+    print("Family to idx mapping:", family_to_idx)
     
     # Save mapping
     mapping = {
@@ -71,10 +68,11 @@ def prepare_data(base_dir='bodmas_batches_test'):
         'family_counts': family_counts,
         'timestamp': datetime.now().isoformat()
     }
+
+    print("Final mapping to be saved:", mapping)
     
     with open(os.path.join(base_dir, 'family_mapping.json'), 'w') as f:
         json.dump(mapping, f, indent=2)
-    
     return split_files, len(families), family_to_idx
 
 def load_batch(batch_file, family_to_idx, batch_size=32, device='cpu'):
@@ -185,7 +183,7 @@ def main():
     
     # Training loop
     phases = ['family', 'goodware', 'novelty']
-    epochs = 30
+    epochs = 3
     
     for phase in phases:
         logger.info(f"\nStarting {phase} phase")

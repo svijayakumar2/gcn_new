@@ -12,7 +12,7 @@ import os
 logger = logging.getLogger(__name__)
 import sys 
 from collections import defaultdict
-
+import json
 
 import torch
 import torch.nn as nn
@@ -296,12 +296,17 @@ class PhasedTraining:
                 class_correct = (preds[class_mask] == c).sum().item()
                 recalls.append(class_correct / class_total if class_total > 0 else 0)
             return precision_correct, total_predictions, sum(recalls) / len(recalls)
-            
+                        
         elif phase == 'goodware':
-            # Same as before
+            # Load mapping file to get none_idx
+            with open('/data/saranyav/gcn_new/bodmas_batches_test/family_mapping.json', 'r') as f:
+                mapping = json.load(f)
+                none_idx = mapping['family_to_idx']['none']
+                
             logits = self.model(batch)
-            is_goodware = (batch.y == 0).bool()
+            is_goodware = (batch.y == none_idx)
             preds = logits[:, 0] > 0
+            
             precision_correct = (preds & is_goodware).sum().item()
             total_predictions = preds.sum().item()
             goodware_correct = (preds & is_goodware).sum().item()

@@ -189,9 +189,8 @@ class DatasetProcessor:
                         # Add metadata
                         graph.sha = row['sha']
                         graph.timestamp = row['timestamp']
-                        if pd.notna(row.get('family')):
-                            graph.family = row['family']
-                            
+                        graph.family = row['family'] if pd.notna(row.get('family')) else 'none'
+
                         batch_graphs.append(graph)
                         
                 except Exception as e:
