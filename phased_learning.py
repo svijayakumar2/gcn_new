@@ -15,7 +15,7 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
-def prepare_data(base_dir='bodmas_batches_test'):
+def prepare_data(base_dir='bodmas_batches'):
     """Prepare datasets with temporal ordering."""
     split_files = defaultdict(list)
     family_counts = defaultdict(int)
@@ -182,8 +182,8 @@ def main():
     trainer = PhasedTraining(model, device)
     
     # Training loop
-    phases = ['family', 'goodware', 'novelty']
-    epochs = 3
+    phases = ['family',  'novelty']
+    epochs = 30
     
     for phase in phases:
         logger.info(f"\nStarting {phase} phase")
@@ -200,6 +200,7 @@ def main():
             
             logger.info(f"Epoch {epoch}: loss={loss:.4f}, "
                         f"precision={precision:.4f}, recall={recall:.4f}")
+            
 
     save_dir = "trained_model"
     os.makedirs(save_dir, exist_ok=True)

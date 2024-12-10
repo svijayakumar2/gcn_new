@@ -244,10 +244,10 @@ class CentroidClassifier(nn.Module):
 
 class PhasedTraining:
     def __init__(self, model, device, lr=0.001):
-        self.model = model
+        self.model = model 
         self.device = device
         self.optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-
+        
     def train_batch(self, batch, phase):
         self.model.train()
         self.model.set_phase(phase)
@@ -258,13 +258,7 @@ class PhasedTraining:
             logits = self.model(batch)
             loss = F.cross_entropy(logits, batch.y)
             
-        elif phase == 'goodware':
-            # Binary classification
-            logits = self.model(batch)
-            is_goodware = (batch.y == 0).float()
-            loss = F.binary_cross_entropy_with_logits(logits[:, 0], is_goodware)
-            
-        else:  # novelty phase
+        else: # novelty phase
             logits, novelty_scores = self.model(batch)
             # Classification loss
             ce_loss = F.cross_entropy(logits, batch.y)
@@ -272,7 +266,7 @@ class PhasedTraining:
             is_novel = (batch.y >= self.model.num_families).float()
             novelty_loss = F.binary_cross_entropy_with_logits(novelty_scores, is_novel)
             loss = ce_loss + novelty_loss
-        
+            
         loss.backward()
         self.optimizer.step()
         return loss.item()
@@ -283,11 +277,11 @@ class PhasedTraining:
         self.model.set_phase(phase)
         
         if phase == 'family':
-            # Same as before
             logits = self.model(batch)
             preds = logits.argmax(dim=1)
             precision_correct = (preds == batch.y).sum().item()
             total_predictions = len(preds)
+            
             classes = torch.unique(batch.y)
             recalls = []
             for c in classes:
@@ -295,39 +289,20 @@ class PhasedTraining:
                 class_total = class_mask.sum().item()
                 class_correct = (preds[class_mask] == c).sum().item()
                 recalls.append(class_correct / class_total if class_total > 0 else 0)
-            return precision_correct, total_predictions, sum(recalls) / len(recalls)
-                        
-        elif phase == 'goodware':
-            # Load mapping file to get none_idx
-            with open('/data/saranyav/gcn_new/bodmas_batches_test/family_mapping.json', 'r') as f:
-                mapping = json.load(f)
-                none_idx = mapping['family_to_idx']['none']
                 
-            logits = self.model(batch)
-            is_goodware = (batch.y == none_idx)
-            preds = logits[:, 0] > 0
-            
-            precision_correct = (preds & is_goodware).sum().item()
-            total_predictions = preds.sum().item()
-            goodware_correct = (preds & is_goodware).sum().item()
-            total_goodware = is_goodware.sum().item()
-            recall = goodware_correct / total_goodware if total_goodware > 0 else 0
-            return precision_correct, total_predictions, recall
+            return precision_correct, total_predictions, sum(recalls) / len(recalls)
             
         else:  # novelty phase
-            embeddings = self.model.get_embedding(batch)
-            distances = self.model.get_distances(embeddings)  # Distance to nearest centroid
-            is_novel = distances > self.model.epsilon  # Beyond threshold = novel
+            embeddings = self.model.encode(batch.x, batch.edge_index, batch.batch)
+            _, novelty_scores = self.model.centroid_layer(embeddings, return_novelty=True)
+            is_novel = novelty_scores > 1.0  # Using normalized scores from centroid layer
             
-            # Something really is novel if it's outside our known families
             truly_novel = batch.y >= self.model.num_families
-            
             precision_correct = (is_novel & truly_novel).sum().item()
             total_predictions = is_novel.sum().item()
             recall = precision_correct / truly_novel.sum().item() if truly_novel.sum().item() > 0 else 0
             
             return precision_correct, total_predictions, recall
-
 # sys.exit(0) 
 # class PhasedTraining:
 #     """Handles phased training for malware GNN"""
