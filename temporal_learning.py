@@ -8,6 +8,9 @@ import glob
 import json
 import numpy as np
 from architectures import PhasedGNN, PhasedTraining
+from torch_geometric.nn import GCNConv, global_mean_pool
+import torch.nn.functional as F
+
 
 # Configure logging
 logging.basicConfig(
@@ -16,6 +19,72 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+class TemporalCentroidTrainer:
+    def __init__(self, model, device):
+        self.model = model
+        self.device = device
+        self.centroids = {}  # Family -> centroid mapping
+        self.temporal_weights = {}  # Family -> timestamp mapping
+
+    def train_batch(self, batch, phase):
+        """Similar interface to your existing PhasedTraining.train_batch()"""
+        self.model.train()
+        batch = batch.to(self.device)
+        embeddings = self.model(batch)
+        
+        loss = 0
+        for i, (emb, family) in enumerate(zip(embeddings, batch.y)):
+            family_str = str(family.item())
+            
+            # Update or initialize centroid
+            if family_str not in self.centroids:
+                self.centroids[family_str] = emb.detach()
+            else:
+                # Temporal update (keeping your data structure)
+                old_weight = 0.7
+                self.centroids[family_str] = (old_weight * self.centroids[family_str] + 
+                                            (1-old_weight) * emb.detach())
+            
+            # Contrastive loss calculation
+            pos_dist = F.cosine_similarity(emb, self.centroids[family_str].unsqueeze(0))
+            neg_dists = []
+            for f, c in self.centroids.items():
+                if f != family_str:
+                    neg_dists.append(F.cosine_similarity(emb, c.unsqueeze(0)))
+            
+            if neg_dists:
+                loss += -pos_dist + torch.stack(neg_dists).mean()
+
+        return loss.item() / len(batch)
+
+    def evaluate(self, batch, phase):
+        """Keep similar interface to your PhasedTraining.evaluate()"""
+        self.model.eval()
+        batch = batch.to(self.device)
+        
+        with torch.no_grad():
+            embeddings = self.model(batch)
+            correct = 0
+            total = len(batch)
+            
+            for emb, true_family in zip(embeddings, batch.y):
+                true_family = str(true_family.item())
+                
+                # Find closest centroid
+                best_dist = float('-inf')
+                best_family = None
+                
+                for family, centroid in self.centroids.items():
+                    dist = F.cosine_similarity(emb, centroid.unsqueeze(0))
+                    if dist > best_dist:
+                        best_dist = dist
+                        best_family = family
+                
+                if best_family == true_family:
+                    correct += 1
+            
+            return correct, total, correct/total
+        
 def prepare_data(base_dir='bodmas_batches'):
     """Prepare datasets with temporal ordering."""
     split_files = defaultdict(list)
@@ -180,73 +249,97 @@ def evaluate(trainer, split_files, family_to_idx, phase, device):
     return precision, recall_sum / max(1, num_batches)
 
 def main():
-    # Setup
+    # Keep your existing setup
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     logger.info(f"Using device: {device}")
     
-    # Load data
+    # Load data using your existing prepare_data
     split_files, num_families, family_to_idx = prepare_data()
     
     if not any(split_files.values()):
         logger.error("No data found!")
         return
         
-    # Get feature dimensions
+    # Get feature dimensions (keep your existing code)
     first_batch = torch.load(split_files['train'][0])
     num_features = first_batch[0].x.size(1)
     logger.info(f"Features: {num_features}, Families: {num_families}")
     
-    # Initialize model and trainer
-    model = PhasedGNN(num_node_features=num_features, 
-                      num_families=num_families).to(device)
-    trainer = PhasedTraining(model, device)
+    # Initialize GNN for embeddings instead of classification
+    model = GNN(num_node_features=num_features, 
+                hidden_dim=128,
+                embedding_dim=64).to(device)
     
-    # Training loop
-    phases = ['family',  'novelty']
+    trainer = TemporalCentroidTrainer(model, device)
+    optimizer = torch.optim.Adam(model.parameters())
+    
+    # Keep your epoch structure but remove phases since we're using centroids
     epochs = 3
+    best_precision = 0
+    
+    for epoch in range(epochs):
+        # Train
+        loss = train_epoch(trainer, split_files['train'], family_to_idx, 'centroid', device)
         
-    for phase in phases:
-        logger.info(f"\nStarting {phase} phase")
+        # Validate
+        precision, recall = evaluate(trainer, split_files['val'], 
+                                family_to_idx, 'centroid', device)
+
+        logger.info(f"Epoch {epoch}: loss={loss:.4f}, "
+                    f"precision={precision:.4f}, recall={recall:.4f}")
         
-        for epoch in range(epochs):
-            # Train
-            loss = train_epoch(trainer, split_files['train'], 
-                            family_to_idx, phase, device)
-                        
-            # Validate
-            precision, recall = evaluate(trainer, split_files['val'], 
-                                    family_to_idx, phase, device)
-
-            logger.info(f"Epoch {epoch}: loss={loss:.4f}, "
-                        f"precision={precision:.4f}, recall={recall:.4f}")
-                        
-            logger.info(f"Epoch {epoch}: loss={loss:.4f}, "
-                        f"precision={precision:.4f}, recall={recall:.4f}")
-
-    save_dir = "trained_model"
-    os.makedirs(save_dir, exist_ok=True)
-    
-    model_path = os.path.join(save_dir, "phased_gnn_final.pt")
-    mapping_path = os.path.join(save_dir, "family_mapping.json")
-    
-    # Save model
-    torch.save({
-        'model_state_dict': model.state_dict(),
-        'num_features': num_features,
-        'num_families': num_families,
-    }, model_path)
-    
-    # Save mapping
-    with open(mapping_path, 'w') as f:
-        json.dump({
-            'family_to_idx': family_to_idx,
-            'idx_to_family': {str(idx): family for family, idx in family_to_idx.items()},
-        }, f, indent=2)
+        # Save best model
+        if precision > best_precision:
+            best_precision = precision
+            save_dir = "trained_model"
+            os.makedirs(save_dir, exist_ok=True)
+            
+            model_path = os.path.join(save_dir, "centroid_gnn_final.pt")
+            mapping_path = os.path.join(save_dir, "family_mapping.json")
+            
+            # Save model, centroids, and mapping
+            torch.save({
+                'model_state_dict': model.state_dict(),
+                'centroids': trainer.centroids,
+                'num_features': num_features,
+                'num_families': num_families,
+            }, model_path)
+            
+            # Save mapping
+            with open(mapping_path, 'w') as f:
+                json.dump({
+                    'family_to_idx': family_to_idx,
+                    'idx_to_family': {str(idx): family 
+                                    for family, idx in family_to_idx.items()},
+                }, f, indent=2)
     
     logger.info(f"Model and mapping saved to {save_dir}/")
+
+class GNN(torch.nn.Module):
+    def __init__(self, num_node_features, hidden_dim, embedding_dim):
+        super().__init__()
+        self.conv1 = GCNConv(num_node_features, hidden_dim)
+        self.conv2 = GCNConv(hidden_dim, hidden_dim)
+        self.fc = torch.nn.Linear(hidden_dim, embedding_dim)
+        
+    def forward(self, data):
+        x, edge_index = data.x, data.edge_index
+        
+        x = F.relu(self.conv1(x, edge_index))
+        x = F.dropout(x, p=0.5, training=self.training)
+        x = self.conv2(x, edge_index)
+        
+        # Global mean pooling
+        batch = data.batch if hasattr(data, 'batch') else torch.zeros(data.x.size(0), dtype=torch.long)
+        x = global_mean_pool(x, batch)
+        
+        # Project to embedding space
+        x = self.fc(x)
+        return F.normalize(x, p=2, dim=1)  # Normalize embeddings
     
 if __name__ == '__main__':
     main()
+
 
 # def evaluate(trainer, split_files, family_to_idx, phase, device):
 #     """Evaluate on a split."""

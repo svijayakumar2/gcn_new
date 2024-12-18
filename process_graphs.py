@@ -14,6 +14,25 @@ import networkx as nx
 from glob import glob
 import multiprocessing as mp
 import gzip 
+import torch 
+
+def convert_node_features_to_tensor(features_dict_list):
+    """Convert list of feature dictionaries to a tensor with consistent dimensions."""
+    # Define the order of features to ensure consistency
+    feature_keys = [
+        'mem_ops', 'calls', 'instructions', 'stack_ops', 'reg_writes',
+        'external_calls', 'internal_calls', 'mem_reads', 'mem_writes',
+        'in_degree', 'out_degree', 'is_conditional', 'has_jump', 'has_ret'
+    ]
+    
+    # Convert each dictionary to a list with consistent order
+    features_list = []
+    for feat_dict in features_dict_list:
+        node_features = [float(feat_dict.get(key, 0)) for key in feature_keys]
+        features_list.append(node_features)
+    
+    # Convert to tensor
+    return torch.tensor(features_list, dtype=torch.float)
 
 
 class BAPInstruction:
@@ -345,12 +364,12 @@ class ParallelBAPProcessor:
 
             output_file = os.path.join(self.output_path, f"{hash_part}.json.gz")
             print(f"Saving to {output_file}")
-            
+                        
             data = {
                 'file': cfg_file,
                 'graph_structure': {
                     'num_nodes': G.number_of_nodes(),
-                    'node_features': node_features,
+                    'node_features': convert_node_features_to_tensor(node_features).tolist(),
                     'edge_index': edge_index,
                     'edge_features': [f for f in edge_features if f['condition'] is not None],
                     'node_mapping': node_mapping

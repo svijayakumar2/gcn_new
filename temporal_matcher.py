@@ -162,9 +162,8 @@ class DatasetProcessor:
             
         logger.info(f"\nTotal processed graphs: {total_processed}")
         return total_processed
-    
     def _process_split(self, split_df: pd.DataFrame, split_dir: Path) -> int:
-        """Process a single data split."""
+        """Process a single data split with feature validation."""
         processed_count = 0
         
         # Process in batches
@@ -174,7 +173,7 @@ class DatasetProcessor:
             
             # Process each file in the batch
             for _, row in tqdm(batch_df.iterrows(), total=len(batch_df), 
-                             desc=f"Processing batch {batch_idx + 1}"):
+                            desc=f"Processing batch {batch_idx + 1}"):
                 try:
                     filepath = self.data_dir / f"{row['sha']}.json.gz"
                     
@@ -186,6 +185,15 @@ class DatasetProcessor:
                         data = json.load(f)
                         graph = self.graph_converter.convert_to_pytorch_geometric(data['graph_structure'])
                         
+                        # Validate feature dimensions using instance attribute
+                        expected_features = 14  # Hardcode for now as we know the exact number
+                        actual_features = graph.x.size(1)
+                        if actual_features != expected_features:
+                            logger.error(f"Feature dimension mismatch in {row['sha']}: "
+                                    f"expected {expected_features}, got {actual_features}")
+                            logger.error(f"Feature tensor shape: {graph.x.shape}")
+                            continue
+
                         # Add metadata
                         graph.sha = row['sha']
                         graph.timestamp = row['timestamp']
@@ -197,21 +205,29 @@ class DatasetProcessor:
                     logger.error(f"Error processing {filepath}: {str(e)}")
                     continue
             
-            # Save batch if not empty
+            # Validate batch feature consistency before saving
             if batch_graphs:
-                batch_file = split_dir / f"batch_{batch_idx:04d}.pt"
-                torch.save(batch_graphs, batch_file)
-                processed_count += len(batch_graphs)
+                feature_dims = [g.x.size(1) for g in batch_graphs]
+                if len(set(feature_dims)) > 1:
+                    logger.error(f"Inconsistent feature dimensions in batch {batch_idx}:")
+                    for i, g in enumerate(batch_graphs):
+                        logger.error(f"Graph {i} ({g.sha}): {g.x.size(1)} features")
+                    # Filter out graphs with wrong dimensions
+                    batch_graphs = [g for g in batch_graphs if g.x.size(1) == expected_features]
                 
-                logger.info(f"Saved {len(batch_graphs)} graphs to {batch_file}")
-                logger.info(f"Time range: {batch_df['timestamp'].min()} to {batch_df['timestamp'].max()}")
+                if batch_graphs:  # Only save if we still have valid graphs
+                    batch_file = split_dir / f"batch_{batch_idx:04d}.pt"
+                    torch.save(batch_graphs, batch_file)
+                    processed_count += len(batch_graphs)
+                    
+                    logger.info(f"Saved {len(batch_graphs)} graphs to {batch_file}")
+                    logger.info(f"Time range: {batch_df['timestamp'].min()} to {batch_df['timestamp'].max()}")
             
         return processed_count
-
 def main():
     processor = DatasetProcessor(
         metadata_path='bodmas_metadata_cleaned.csv',
-        data_dir='cfg_analysis_results',#'cfg_analysis_results',
+        data_dir='cfg_analysis_results/cfg_analysis_results',#'cfg_analysis_results',
         output_dir='bodmas_batches',
         batch_size=100,
         train_ratio=0.7,
