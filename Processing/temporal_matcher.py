@@ -17,6 +17,44 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+class MetadataManager:
+    """Handle metadata loading and merging."""
+    
+    @staticmethod
+    def load_and_merge_metadata(primary_metadata_path: str, malware_types_path: str) -> pd.DataFrame:
+        """Load and merge primary metadata with malware types."""
+        logger.info(f"Reading primary metadata from {primary_metadata_path}")
+        primary_df = pd.read_csv(primary_metadata_path)
+        
+        logger.info(f"Reading malware types from {malware_types_path}")
+        malware_types_df = pd.read_csv(malware_types_path)
+        
+        # Extract filename without extension for joining
+        primary_df['filename'] = primary_df['sha'].apply(lambda x: x)
+        malware_types_df['filename'] = malware_types_df['sha256'].apply(lambda x: Path(x).stem)
+        # drop duplicate column 256
+        malware_types_df.drop('sha256', axis=1, inplace=True)
+        
+        # Merge dataframes
+        merged_df = pd.merge(
+            primary_df,
+            malware_types_df[['filename', 'category']],
+            on='filename',
+            how='left'
+        )
+        
+        # Clean up
+        merged_df.drop('filename', axis=1, inplace=True)
+        
+        # Fill missing malware types
+        merged_df['malware_type'] = merged_df['category'].fillna('unknown')
+        
+        logger.info(f"Merged metadata shape: {merged_df.shape}")
+        logger.info("\nMalware type distribution:")
+        logger.info(merged_df['malware_type'].value_counts())
+        
+        return merged_df
+
 class TimestampCleaner:
     """Handle timestamp cleaning and standardization."""
     
@@ -38,7 +76,6 @@ class TimestampCleaner:
                 continue
         
         try:
-            # Last resort: try pandas' flexible parser
             dt = pd.to_datetime(ts)
             return dt.tz_localize('UTC' if dt.tz is None else None).strftime('%Y-%m-%d %H:%M:%S UTC')
         except Exception as e:
@@ -46,13 +83,10 @@ class TimestampCleaner:
             return None
 
     @classmethod
-    def clean_metadata_timestamps(cls, metadata_path: str, output_path: Optional[str] = None) -> pd.DataFrame:
-        """Clean and standardize timestamps in metadata file."""
-        logger.info(f"Reading metadata from {metadata_path}")
-        df = pd.read_csv(metadata_path)
-        
+    def clean_metadata_timestamps(cls, df: pd.DataFrame) -> pd.DataFrame:
+        """Clean and standardize timestamps in metadata DataFrame."""
         if 'timestamp' not in df.columns:
-            raise ValueError("Metadata file must contain a 'timestamp' column")
+            raise ValueError("Metadata must contain a 'timestamp' column")
             
         logger.info("Original timestamp samples:")
         logger.info(df['timestamp'].head())
@@ -62,10 +96,6 @@ class TimestampCleaner:
         
         logger.info("Cleaned timestamp samples:")
         logger.info(df['timestamp'].head())
-        
-        if output_path:
-            df.to_csv(output_path, index=False)
-            logger.info(f"Saved cleaned metadata to {output_path}")
             
         return df
 
@@ -79,7 +109,7 @@ class GraphConverter:
             # Extract feature keys
             feature_keys = sorted(list({
                 key for node in graph_structure['node_features'] 
-                for key in node.keys() if key != 'id'  # Exclude id from features
+                for key in node.keys() if key != 'id'
             }))
             
             # Create feature vectors
@@ -118,13 +148,15 @@ class DatasetProcessor:
     """Process and batch the dataset."""
     
     def __init__(self, 
-                 metadata_path: str,
+                 primary_metadata_path: str,
+                 malware_types_path: str,
                  data_dir: str,
                  output_dir: str,
                  batch_size: int = 100,
                  train_ratio: float = 0.7,
                  val_ratio: float = 0.15):
-        self.metadata_path = metadata_path
+        self.primary_metadata_path = primary_metadata_path
+        self.malware_types_path = malware_types_path
         self.data_dir = Path(data_dir)
         self.output_dir = Path(output_dir)
         self.batch_size = batch_size
@@ -134,10 +166,16 @@ class DatasetProcessor:
     
     def process(self):
         """Process the complete dataset."""
-        # Clean metadata
-        df = TimestampCleaner.clean_metadata_timestamps(self.metadata_path)
+        # Load and merge metadata
+        df = MetadataManager.load_and_merge_metadata(
+            self.primary_metadata_path,
+            self.malware_types_path
+        )
         
-        # Sort by timestamp -  we want temporal splits, not random
+        # Clean metadata timestamps
+        df = TimestampCleaner.clean_metadata_timestamps(df)
+        
+        # Sort by timestamp - we want temporal splits, not random
         df = df.sort_values('timestamp')
         logger.info(f"Processing {len(df)} samples")
         
@@ -162,6 +200,7 @@ class DatasetProcessor:
             
         logger.info(f"\nTotal processed graphs: {total_processed}")
         return total_processed
+
     def _process_split(self, split_df: pd.DataFrame, split_dir: Path) -> int:
         """Process a single data split with feature validation."""
         processed_count = 0
@@ -185,7 +224,7 @@ class DatasetProcessor:
                         data = json.load(f)
                         graph = self.graph_converter.convert_to_pytorch_geometric(data['graph_structure'])
                         
-                        # Validate feature dimensions using instance attribute
+                        # Validate feature dimensions
                         expected_features = 14  # Hardcode for now as we know the exact number
                         actual_features = graph.x.size(1)
                         if actual_features != expected_features:
@@ -197,7 +236,8 @@ class DatasetProcessor:
                         # Add metadata
                         graph.sha = row['sha']
                         graph.timestamp = row['timestamp']
-                        graph.family = row['family'] if pd.notna(row.get('family')) else 'none'
+                        graph.family = row['family'] if pd.notna(row.get('family')) else 'benign'
+                        graph.malware_type = row['malware_type']
 
                         batch_graphs.append(graph)
                         
@@ -224,10 +264,12 @@ class DatasetProcessor:
                     logger.info(f"Time range: {batch_df['timestamp'].min()} to {batch_df['timestamp'].max()}")
             
         return processed_count
+
 def main():
     processor = DatasetProcessor(
-        metadata_path='bodmas_metadata_cleaned.csv',
-        data_dir='cfg_analysis_results/cfg_analysis_results',#'cfg_analysis_results',
+        primary_metadata_path='bodmas_metadata_cleaned.csv',
+        malware_types_path='bodmas_malware_category.csv',  # Add path to your malware types file
+        data_dir='cfg_analysis_results/cfg_analysis_results',
         output_dir='bodmas_batches',
         batch_size=100,
         train_ratio=0.7,

@@ -6,6 +6,8 @@ from typing import Dict, List, Optional
 from collections import defaultdict
 import networkx as nx
 from tqdm import tqdm
+# counter
+from collections import Counter
 
 # Set up logging similar to your temporal.py
 logging.basicConfig(
@@ -15,38 +17,53 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 class BehavioralSimilarityComputer:
-    """Compute similarity between malware family behavioral profiles."""
+    """Compute similarity between malware family behavioral profiles efficiently."""
     
     def __init__(self, family_distributions: Dict):
         self.family_distributions = family_distributions
-        
+    
     def compute_similarity(self, profile1: Dict, profile2: Dict) -> float:
         """
-        Compute similarity score between two family behavioral profiles using
-        Jensen-Shannon divergence for distributions and cosine similarity for patterns.
-        Returns a score between 0 (completely different) and 1 (identical).
+        Compute similarity score between two family behavioral profiles.
+        Uses efficient vectorized operations where possible.
         """
-        # Compute similarities for each component
-        similarities = [
-            self._compare_feature_distributions(
-                profile1['feature_stats'], 
-                profile2['feature_stats']
-            ),
-            self._compare_behavior_patterns(
-                profile1['behavior_patterns'], 
-                profile2['behavior_patterns']
-            ),
-            self._compare_graph_characteristics(
-                profile1['graph_characteristics'], 
-                profile2['graph_characteristics']
-            )
-        ]
+        similarities = []
         
-        # Return average similarity
-        return np.mean([s for s in similarities if s is not None])
+        # 1. Compare feature distributions using histogram intersection
+        feat_sim = self._compare_feature_distributions(
+            profile1['feature_stats'], 
+            profile2['feature_stats']
+        )
+        if feat_sim is not None:
+            similarities.append((feat_sim, 0.4))  # Weight: 0.4
+        
+        # 2. Compare behavior patterns
+        pattern_sim = self._compare_pattern_vectors(
+            profile1['behavior_patterns'],
+            profile2['behavior_patterns']
+        )
+        if pattern_sim is not None:
+            similarities.append((pattern_sim, 0.4))  # Weight: 0.4
+        
+        # 3. Compare local structures
+        struct_sim = self._compare_pattern_vectors(
+            profile1['local_structures'],
+            profile2['local_structures']
+        )
+        if struct_sim is not None:
+            similarities.append((struct_sim, 0.2))  # Weight: 0.2
+        
+        if not similarities:
+            return 0.0
+        
+        # Compute weighted average
+        total_weight = sum(weight for _, weight in similarities)
+        weighted_sum = sum(sim * weight for sim, weight in similarities)
+        
+        return weighted_sum / total_weight
     
     def _compare_feature_distributions(self, stats1: Dict, stats2: Dict) -> Optional[float]:
-        """Compare feature distributions using Jensen-Shannon divergence."""
+        """Compare feature distributions using histogram intersection."""
         if not stats1 or not stats2:
             return None
             
@@ -55,108 +72,31 @@ class BehavioralSimilarityComputer:
             if feature not in stats2:
                 continue
                 
-            # Create probability distributions from feature stats
-            # Use histogram data if available, otherwise create simple distributions
-            # from mean and std using normal distribution approximation
-            bins = 50
-            range_max = max(stats1[feature]['max_val'], stats2[feature]['max_val'])
-            if range_max == 0:
-                feature_sims.append(1.0)  # Both distributions are zero
-                continue
-                
-            # Create distributions using mean and std
-            x = np.linspace(0, range_max, bins)
-            p1 = self._create_distribution(x, stats1[feature])
-            p2 = self._create_distribution(x, stats2[feature])
+            hist1 = np.array(stats1[feature]['histogram'])
+            hist2 = np.array(stats2[feature]['histogram'])
             
-            # Compute Jensen-Shannon divergence
-            js_div = self._jensen_shannon_divergence(p1, p2)
-            # Convert to similarity score (1 - normalized divergence)
-            feature_sims.append(1 - js_div)
+            # Compute histogram intersection
+            intersection = np.minimum(hist1, hist2).sum()
+            union = np.maximum(hist1, hist2).sum()
+            
+            if union > 0:
+                feature_sims.append(intersection / union)
         
         return np.mean(feature_sims) if feature_sims else None
-        
-    def _create_distribution(self, x: np.ndarray, stats: Dict) -> np.ndarray:
-        """Create a probability distribution from feature statistics."""
-        # Create normal distribution using mean and std
-        mean, std = stats['mean'], stats['std']
-        if std == 0:
-            std = mean * 0.1 if mean != 0 else 0.1  # Avoid zero std
-            
-        dist = np.exp(-0.5 * ((x - mean) / std) ** 2)
-        # Add small epsilon to avoid division by zero
-        dist_sum = np.sum(dist)
-        if dist_sum == 0:
-            return np.ones_like(dist) / len(dist)  # Uniform distribution if all zeros
-        
-        dist = dist / dist_sum  # Normalize
-        
-        # Incorporate density information
-        density = stats['density']
-        dist = dist * density + (1 - density) * (dist == 0)
-        dist_sum = np.sum(dist)
-        if dist_sum == 0:
-            return np.ones_like(dist) / len(dist)
-        return dist / dist_sum  # Renormalize
     
-    def _jensen_shannon_divergence(self, p: np.ndarray, q: np.ndarray) -> float:
-        """Compute Jensen-Shannon divergence between two distributions."""
-        # Add small epsilon to avoid log(0)
-        epsilon = 1e-10
-        p = p + epsilon
-        q = q + epsilon
-        
-        # Normalize
-        p = p / np.sum(p)
-        q = q / np.sum(q)
-        
-        m = 0.5 * (p + q)
-        js_div = 0.5 * (
-            np.sum(p * np.log2(p / m)) + 
-            np.sum(q * np.log2(q / m))
-        )
-        
-        # Normalize to [0,1]
-        return js_div / np.log2(2)
-    
-    def _compare_behavior_patterns(self, patterns1: Dict, patterns2: Dict) -> Optional[float]:
-        """Compare behavioral patterns using cosine similarity."""
+    def _compare_pattern_vectors(self, patterns1: Dict, patterns2: Dict) -> Optional[float]:
+        """Compare pattern frequency vectors using cosine similarity."""
         if not patterns1 or not patterns2:
             return None
-            
-        # Get all unique patterns
+        
+        # Get all patterns
         all_patterns = sorted(set(patterns1.keys()) | set(patterns2.keys()))
         if not all_patterns:
             return None
-            
-        # Create feature vectors
+        
+        # Create frequency vectors
         vec1 = np.array([patterns1.get(p, 0) for p in all_patterns])
         vec2 = np.array([patterns2.get(p, 0) for p in all_patterns])
-        
-        # Compute cosine similarity
-        norm1 = np.linalg.norm(vec1)
-        norm2 = np.linalg.norm(vec2)
-        
-        if norm1 == 0 and norm2 == 0:
-            return 1.0  # Both vectors are zero - consider them similar
-        elif norm1 == 0 or norm2 == 0:
-            return 0.0  # One vector is zero, one isn't - consider them different
-            
-        return np.dot(vec1, vec2) / (norm1 * norm2)
-    
-    def _compare_graph_characteristics(self, chars1: Dict, chars2: Dict) -> Optional[float]:
-        """Compare graph characteristics using cosine similarity."""
-        if not chars1 or not chars2:
-            return None
-            
-        # Get all characteristics
-        all_chars = sorted(set(chars1.keys()) | set(chars2.keys()))
-        if not all_chars:
-            return None
-            
-        # Create feature vectors
-        vec1 = np.array([chars1.get(c, 0) for c in all_chars])
-        vec2 = np.array([chars2.get(c, 0) for c in all_chars])
         
         # Compute cosine similarity
         norm1 = np.linalg.norm(vec1)
@@ -166,7 +106,7 @@ class BehavioralSimilarityComputer:
             return 1.0
         elif norm1 == 0 or norm2 == 0:
             return 0.0
-            
+        
         return np.dot(vec1, vec2) / (norm1 * norm2)
     
 class MalwareBehaviorAggregator:
@@ -179,13 +119,8 @@ class MalwareBehaviorAggregator:
 
     def _aggregate_family_behaviors(self, pyg_graphs: List) -> Dict:
         """
-        Aggregate behavioral features directly from PyG graphs.
-        
-        Args:
-            pyg_graphs: List of PyG graphs
-            
-        Returns:
-            Dictionary of graph-level behavioral signatures
+        Aggregate behavioral features efficiently by focusing on key patterns
+        and local structures rather than expensive graph operations.
         """
         feature_names = [
             'mem_ops', 'calls', 'instructions', 'stack_ops', 'reg_writes',
@@ -193,119 +128,269 @@ class MalwareBehaviorAggregator:
             'in_degree', 'out_degree', 'is_conditional', 'has_jump', 'has_ret'
         ]
         
-        # Initialize with regular dictionaries instead of defaultdict
+        # Initialize aggregated features
         family_features = {
-            'feature_distributions': {},
-            'node_behavior_patterns': {
-                'external_calling': 0,
-                'external_with_write': 0,
-                'conditional_jump': 0,
-                'memory_rw': 0
-            },
-            'graph_signatures': []
+            'feature_histograms': defaultdict(list),
+            'behavior_patterns': defaultdict(float),
+            'local_structures': defaultdict(float)
         }
         
-        # Initialize feature distributions
-        for feature in feature_names:
-            family_features['feature_distributions'][feature] = []
+        total_nodes = 0
+        n_bins = 20  # Fixed number of bins for all histograms
         
         for graph in pyg_graphs:
-            # Work with node features directly from PyG
-            node_features = graph.x.numpy()  # Convert to numpy for easier handling
+            node_features = graph.x.numpy()
+            edge_index = graph.edge_index.t().numpy()
+            num_nodes = len(node_features)
+            total_nodes += num_nodes
             
-            # 1. Calculate distributions for each feature
+            # 1. Efficient feature distributions using numpy operations
             for feat_idx, feature in enumerate(feature_names):
                 values = node_features[:, feat_idx]
                 if len(values) > 0:
-                    family_features['feature_distributions'][feature].append({
-                        'mean': float(np.mean(values)),
-                        'std': float(np.std(values)),
-                        'max': float(np.max(values)),
-                        'density': float(len(values[values > 0])) / len(values)
-                    })
+                    hist, _ = np.histogram(values, bins=n_bins, range=(0, np.max(values) + 1e-6), density=True)
+                    family_features['feature_histograms'][feature].append(hist)
             
-            # 2. Extract behavioral node patterns
-            # Use column indices for efficiency
-            external_calls = node_features[:, feature_names.index('external_calls')]
-            mem_writes = node_features[:, feature_names.index('mem_writes')]
-            mem_reads = node_features[:, feature_names.index('mem_reads')]
-            is_conditional = node_features[:, feature_names.index('is_conditional')]
-            has_jump = node_features[:, feature_names.index('has_jump')]
+            # 2. Behavior patterns - look for significant combinations
+            # Pre-compute boolean masks for efficiency
+            has_ext_calls = node_features[:, feature_names.index('external_calls')] > 0
+            has_mem_write = node_features[:, feature_names.index('mem_writes')] > 0
+            has_mem_read = node_features[:, feature_names.index('mem_reads')] > 0
+            is_conditional = node_features[:, feature_names.index('is_conditional')] > 0
+            has_jump = node_features[:, feature_names.index('has_jump')] > 0
             
-            # Count behavioral patterns
-            family_features['node_behavior_patterns']['external_calling'] += int(np.sum(external_calls > 0))
-            family_features['node_behavior_patterns']['external_with_write'] += int(np.sum(
-                (external_calls > 0) & (mem_writes > 0)
-            ))
-            family_features['node_behavior_patterns']['conditional_jump'] += int(np.sum(
-                (is_conditional > 0) & (has_jump > 0)
-            ))
-            family_features['node_behavior_patterns']['memory_rw'] += int(np.sum(
-                (mem_reads > 0) & (mem_writes > 0)
-            ))
-            
-            # 3. Graph-level signatures
-            graph_sig = {
-                'size': len(node_features),
-                'active_nodes': int(np.sum(np.any(node_features > 0, axis=1))),
-                'api_density': float(np.sum(external_calls)) / len(node_features),
-                'control_flow_complexity': float(np.sum(is_conditional + has_jump)) / len(node_features)
+            # Update pattern counts efficiently using numpy
+            patterns = {
+                'ext_call': np.sum(has_ext_calls),
+                'mem_rw': np.sum(has_mem_read & has_mem_write),
+                'cond_jump': np.sum(is_conditional & has_jump),
+                'ext_write': np.sum(has_ext_calls & has_mem_write)
             }
-            family_features['graph_signatures'].append(graph_sig)
+            
+            for pattern, count in patterns.items():
+                family_features['behavior_patterns'][pattern] += count / num_nodes
+            
+            # 3. Local structure analysis - focus on node neighborhood characteristics
+            if len(edge_index) > 0:  # Only compute if we have edges
+                in_degrees = np.bincount(edge_index[:, 1], minlength=num_nodes)
+                out_degrees = np.bincount(edge_index[:, 0], minlength=num_nodes)
+                
+                # Analyze local structures
+                structures = {
+                    'branching_nodes': np.sum(out_degrees > 1) / num_nodes,
+                    'merge_nodes': np.sum(in_degrees > 1) / num_nodes,
+                    'terminal_nodes': np.sum((out_degrees == 0) & (in_degrees > 0)) / num_nodes,
+                    'isolated_nodes': np.sum((in_degrees == 0) & (out_degrees == 0)) / num_nodes,
+                    'dense_regions': np.sum((in_degrees > 2) & (out_degrees > 2)) / num_nodes
+                }
+                
+                for struct, ratio in structures.items():
+                    family_features['local_structures'][struct] += ratio
         
-        # Skip families with no valid data
-        if not any(family_features['feature_distributions'].values()):
+        num_graphs = len(pyg_graphs)
+        if num_graphs == 0:
             return None
-        
-        # Normalize behavior patterns by total number of nodes across all graphs
-        total_nodes = sum(len(g.x) for g in pyg_graphs)
-        normalized_patterns = {
-            pattern: float(count) / total_nodes
-            for pattern, count in family_features['node_behavior_patterns'].items()
-        }
-        
-        # Aggregate final distributions
-        aggregated = {
-            # Average distributions for each feature
+            
+        # Finalize features
+        return {
             'feature_stats': {
                 feature: {
-                    'mean': float(np.mean([d['mean'] for d in dists])),
-                    'std': float(np.mean([d['std'] for d in dists])),
-                    'max_val': float(np.max([d['max'] for d in dists])),
-                    'density': float(np.mean([d['density'] for d in dists]))
+                    'histogram': np.mean(np.array(hists), axis=0).tolist(),
+                    'histogram_std': np.std(np.array(hists), axis=0).tolist()
                 }
-                for feature, dists in family_features['feature_distributions'].items()
-                if dists  # Only process features that have data
+                for feature, hists in family_features['feature_histograms'].items()
+                if hists  # Only include features that have histograms
             },
-            
-            'behavior_patterns': normalized_patterns,
-            
-            # Average graph signatures
-            'graph_characteristics': {
-                metric: float(np.mean([sig[metric] for sig in family_features['graph_signatures']]))
-                for metric in ['size', 'active_nodes', 'api_density', 'control_flow_complexity']
+            'behavior_patterns': {
+                pattern: count / num_graphs
+                for pattern, count in family_features['behavior_patterns'].items()
+            },
+            'local_structures': {
+                struct: count / num_graphs
+                for struct, count in family_features['local_structures'].items()
             }
         }
+
+    def _extract_operation_sequences(self, node_features: np.ndarray, edge_index: np.ndarray, 
+                                feature_names: List[str], max_length: int = 5) -> List[str]:
+        """Extract sequences of operations along paths in the graph."""
+        sequences = []
+        n_nodes = len(node_features)
         
-        return aggregated
+        # Create adjacency list for faster traversal
+        adj_list = [[] for _ in range(n_nodes)]
+        for src, dst in edge_index:
+            adj_list[src].append(dst)
+        
+        # Find entry points (nodes with no incoming edges)
+        in_degree = np.zeros(n_nodes)
+        for _, dst in edge_index:
+            in_degree[dst] += 1
+        entry_points = np.where(in_degree == 0)[0]
+        
+        # DFS from each entry point to extract operation sequences
+        def get_node_signature(node_idx):
+            features = node_features[node_idx]
+            sig_parts = []
+            if features[feature_names.index('external_calls')] > 0:
+                sig_parts.append('EXT')
+            if features[feature_names.index('mem_writes')] > 0:
+                sig_parts.append('WRITE')
+            if features[feature_names.index('mem_reads')] > 0:
+                sig_parts.append('READ')
+            if features[feature_names.index('is_conditional')] > 0:
+                sig_parts.append('COND')
+            return '_'.join(sig_parts) if sig_parts else 'NOP'
+        
+        def dfs_sequence(node, path, visited):
+            if len(path) >= max_length:
+                sequences.append('->'.join(path))
+                return
+            visited.add(node)
+            for next_node in adj_list[node]:
+                if next_node not in visited:
+                    path.append(get_node_signature(next_node))
+                    dfs_sequence(next_node, path, visited.copy())
+                    path.pop()
+        
+        # Extract sequences from each entry point
+        for entry in entry_points:
+            dfs_sequence(entry, [get_node_signature(entry)], set())
+        
+        return sequences
+
+    def _find_subgraph_patterns(self, node_features: np.ndarray, edge_index: np.ndarray, 
+                            pattern_size: int = 3) -> Dict[str, int]:
+        """Find and count common subgraph patterns."""
+        patterns = defaultdict(int)
+        n_nodes = len(node_features)
+        
+        # Create adjacency matrix for faster neighbor checking
+        adj_matrix = np.zeros((n_nodes, n_nodes))
+        for src, dst in edge_index:
+            adj_matrix[src, dst] = 1
+        
+        # Helper to create pattern signature
+        def get_pattern_signature(nodes):
+            # Sort nodes by their feature values for canonical representation
+            node_sigs = []
+            for n in nodes:
+                feats = node_features[n]
+                node_sigs.append(f"{int(feats[5])}{int(feats[7])}{int(feats[8])}{int(feats[11])}")
+            return '-'.join(sorted(node_sigs))
+        
+        # Find all connected subgraphs of size pattern_size
+        for start_node in range(n_nodes):
+            stack = [(start_node, [start_node])]
+            while stack:
+                node, current_pattern = stack.pop()
+                if len(current_pattern) == pattern_size:
+                    pattern_sig = get_pattern_signature(current_pattern)
+                    patterns[pattern_sig] += 1
+                    continue
+                
+                # Add neighbors to pattern
+                neighbors = np.where(adj_matrix[node] > 0)[0]
+                for neighbor in neighbors:
+                    if neighbor not in current_pattern:
+                        stack.append((neighbor, current_pattern + [neighbor]))
+        
+        return patterns
+
+    def _count_graph_motifs(self, node_features: np.ndarray, edge_index: np.ndarray) -> Dict[str, int]:
+        """Count occurrences of important graph motifs."""
+        motifs = defaultdict(int)
+        n_nodes = len(node_features)
+        
+        # Create adjacency matrix
+        adj_matrix = np.zeros((n_nodes, n_nodes))
+        for src, dst in edge_index:
+            adj_matrix[src, dst] = 1
+        
+        # 1. Find feedback loops
+        for i in range(n_nodes):
+            # Simple self-loop
+            if adj_matrix[i, i]:
+                motifs['self_loop'] += 1
+                
+            # Two-node feedback
+            for j in range(i + 1, n_nodes):
+                if adj_matrix[i, j] and adj_matrix[j, i]:
+                    motifs['two_node_feedback'] += 1
+        
+        # 2. Find branching patterns
+        for i in range(n_nodes):
+            out_degree = np.sum(adj_matrix[i])
+            if out_degree > 1:
+                motifs[f'branch_{int(out_degree)}'] += 1
+        
+        # 3. Find converging patterns
+        for i in range(n_nodes):
+            in_degree = np.sum(adj_matrix[:, i])
+            if in_degree > 1:
+                motifs[f'merge_{int(in_degree)}'] += 1
+        
+        return motifs
+
+    def _finalize_family_features(self, family_features: Dict, n_graphs: int) -> Dict:
+        """Finalize and normalize family-level features."""
+        # Normalize histogram counts
+        feature_stats = {}
+        for feature, histograms in family_features['feature_histograms'].items():
+            # Compute average histogram
+            all_hist = np.array([h['histogram'] for h in histograms])
+            avg_hist = np.mean(all_hist, axis=0)
+            feature_stats[feature] = {
+                'histogram': avg_hist.tolist(),
+                'bin_edges': histograms[0]['bin_edges']  # Use first bin edges
+            }
+        
+        # Get most common sequences
+        from collections import Counter
+        sequence_counts = Counter(family_features['node_sequences'])
+        top_sequences = dict(sequence_counts.most_common(10))
+        
+        # Normalize pattern counts
+        subgraph_patterns = {
+            k: v / n_graphs for k, v in family_features['subgraph_patterns'].items()
+        }
+        
+        motif_patterns = {
+            k: v / n_graphs for k, v in family_features['graph_motifs'].items()
+        }
+        
+        return {
+            'feature_distributions': feature_stats,
+            'common_sequences': top_sequences,
+            'subgraph_patterns': subgraph_patterns,
+            'motif_patterns': motif_patterns
+        }
 
     def load_processed_batches(self, split: str = 'train'):
         """Load preprocessed PyG graphs from batches."""
         split_dir = self.batch_dir / split
         logger.info(f"Loading batches from {split_dir}")
         
+        # Track malware types
+        self.malware_types = {}
+        
         for batch_file in tqdm(list(split_dir.glob("batch_*.pt")), desc="Loading batches"):
             try:
                 batch_graphs = torch.load(batch_file)
                 for graph in batch_graphs:
                     self.family_graphs[graph.family].append(graph)
+                    self.malware_types[graph.family] = graph.malware_type
             except Exception as e:
                 logger.error(f"Error loading {batch_file}: {str(e)}")
                 continue
         
         logger.info(f"Loaded {len(self.family_graphs)} families")
-        for family, graphs in self.family_graphs.items():
-            logger.info(f"Family {family}: {len(graphs)} samples")
+        
+        # Log distribution of malware types
+        type_counts = Counter(self.malware_types.values())
+        logger.info("\nMalware type distribution:")
+        for mtype, count in type_counts.most_common():
+            logger.info(f"{mtype}: {count} families")
 
     def _convert_pyg_to_networkx(self, pyg_graph) -> nx.DiGraph:
         """Convert PyG graph to NetworkX for feature extraction."""
@@ -363,168 +448,142 @@ class MalwareBehaviorAggregator:
         else:
             logger.info(f"Successfully processed {len(self.family_distributions)} families")
 
-    def create_behavioral_groups(self, n_clusters: Optional[int] = None):
-        """
-        Create behavioral groups from processed families.
-        Args:
-            n_clusters: Target number of clusters. If None, will estimate using silhouette analysis.
-        """
+    def create_behavioral_groups(self, similarity_threshold: Optional[float] = None):
+        """Create behavioral groups constrained by malware types, with special handling for benign samples."""
         if not self.family_distributions:
             raise ValueError("No family distributions available. Run process_families first.")
-            
+                
         similarity_computer = BehavioralSimilarityComputer(self.family_distributions)
         
-        # Compute similarity matrix
+        # Separate benign and malware families
         families = list(self.family_distributions.keys())
-        n_families = len(families)
+        malware_families = [f for f in families if f != 'benign']
+        n_families = len(malware_families)
+        
+        # Handle benign families separately
+        benign_families = [f for f in families if f == 'benign']
+        if benign_families:
+            logger.info(f"\nFound {len(benign_families)} benign families - will be grouped together")
+        
+        # Compute similarity matrix for malware families
         similarity_matrix = np.zeros((n_families, n_families))
         
         logger.info("Computing family similarities...")
-        for i, fam1 in enumerate(tqdm(families)):
-            for j, fam2 in enumerate(families):
-                similarity_matrix[i,j] = similarity_computer.compute_similarity(
-                    self.family_distributions[fam1],
-                    self.family_distributions[fam2]
-                )
+        for i, fam1 in enumerate(tqdm(malware_families)):
+            for j, fam2 in enumerate(malware_families):
+                # If malware types are different, set similarity to 0
+                if self.malware_types[fam1] != self.malware_types[fam2]:
+                    similarity_matrix[i,j] = 0
+                else:
+                    similarity_matrix[i,j] = similarity_computer.compute_similarity(
+                        self.family_distributions[fam1],
+                        self.family_distributions[fam2]
+                    )
         
         # Handle any NaN values
         similarity_matrix = np.nan_to_num(similarity_matrix, nan=0.0)
+        
+        # Convert similarity to distance
         distance_matrix = 1 - similarity_matrix
         
-        from sklearn.cluster import AgglomerativeClustering
-        from sklearn.metrics import silhouette_score
+        # Find optimal clustering
+        labels, sil_score = self._find_optimal_clusters(distance_matrix, malware_families)
+        logger.info(f"Final Silhouette Score: {sil_score:.3f}")
         
-        if n_clusters is None:
-            # Try different numbers of clusters and use silhouette analysis
-            candidate_n_clusters = [10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21]
-            scores = []
-            
-            for n in candidate_n_clusters:
-                clustering = AgglomerativeClustering(
-                    n_clusters=n,
-                    metric='precomputed',
-                    linkage='average'
-                )
-                labels = clustering.fit_predict(distance_matrix)
-                score = silhouette_score(distance_matrix, labels, metric='precomputed')
-                scores.append(score)
-                logger.info(f"Clusters: {n}, Silhouette Score: {score:.3f}")
-            
-            # Pick number of clusters with best score
-            best_n = candidate_n_clusters[np.argmax(scores)]
-            logger.info(f"Selected {best_n} clusters based on silhouette analysis")
-            n_clusters = best_n
-        
-        # Perform final clustering
-        clustering = AgglomerativeClustering(
-            n_clusters=n_clusters,
-            metric='precomputed',
-            linkage='average'
-        )
-        
-        labels = clustering.fit_predict(distance_matrix)
-        
-        # Create groups
+        # Create groups - start with benign group
         behavioral_groups = defaultdict(list)
-        for family, label in zip(families, labels):
+        if benign_families:
+            behavioral_groups[0] = benign_families
+            # Adjust other labels to start from 1
+            labels = [l + 1 for l in labels]
+        
+        # Add malware groups
+        for family, label in zip(malware_families, labels):
             behavioral_groups[label].append(family)
         
-        # Log grouping results with more detailed statistics
-        n_groups = len(behavioral_groups)
-        logger.info(f"\nFound {n_groups} behavioral groups:")
+        # Log grouping results
+        logger.info(f"\nFound {len(behavioral_groups)} behavioral groups:")
         
-        # Compute group statistics
-        group_sizes = [len(families) for families in behavioral_groups.values()]
-        logger.info(f"Average group size: {np.mean(group_sizes):.1f}")
-        logger.info(f"Group size std: {np.std(group_sizes):.1f}")
-        logger.info(f"Largest group: {max(group_sizes)}")
-        logger.info(f"Smallest group: {min(group_sizes)}")
+        # Log benign group first if it exists
+        if benign_families:
+            logger.info(f"\nGroup 0 (Benign): {len(benign_families)} families")
+            if len(benign_families) > 10:
+                logger.info(f"Sample families: {', '.join(benign_families[:10])}...")
+            else:
+                logger.info(f"Families: {', '.join(benign_families)}")
         
-        # Sort groups by size for better visualization
-        sorted_groups = sorted(behavioral_groups.items(), key=lambda x: len(x[1]), reverse=True)
-        
-        # Log individual groups
-        for group_id, group_families in sorted_groups:
+        # Log malware groups
+        for group_id, group_families in behavioral_groups.items():
+            if group_id == 0:  # Skip benign group as it's already logged
+                continue
             logger.info(f"\nGroup {group_id}: {len(group_families)} families")
+            mtype = self.malware_types[group_families[0]]  # All families in group should have same type
+            logger.info(f"Malware type: {mtype}")
+            
             if len(group_families) > 10:
                 logger.info(f"Sample families: {', '.join(group_families[:10])}...")
             else:
                 logger.info(f"Families: {', '.join(group_families)}")
-                
-            # Log some behavioral characteristics of the group
-            if len(group_families) > 0:
-                example_family = group_families[0]
-                example_dist = self.family_distributions[example_family]
-                behaviors = example_dist['behavior_patterns']
-                top_behaviors = sorted(behaviors.items(), key=lambda x: x[1], reverse=True)[:3]
-                logger.info("Characteristic behaviors: " + 
-                        ", ".join(f"{b}: {v:.2f}" for b, v in top_behaviors))
         
-        # Validate clustering quality
-        sil_score = silhouette_score(distance_matrix, labels, metric='precomputed')
-        logger.info(f"\nFinal silhouette score: {sil_score:.3f}")
-            
         return behavioral_groups, similarity_matrix
-                
-    def _find_optimal_threshold(self, similarity_matrix: np.ndarray) -> float:
-        """Find optimal similarity threshold using distribution analysis."""
+                    
+    def _find_optimal_clusters(self, distance_matrix: np.ndarray, malware_families: list) -> tuple:
+        """Test different numbers of clusters and find the optimal based on silhouette score."""
         from sklearn.cluster import AgglomerativeClustering
-        
-        # Convert similarity to distance
-        distance_matrix = 1 - similarity_matrix
-        distance_matrix = np.nan_to_num(distance_matrix, nan=np.max(distance_matrix[~np.isnan(distance_matrix)]))
-        
-        # Use finer-grained thresholds and focus on higher similarity range
-        thresholds = np.linspace(0.05, 0.5, 30)  # Lower thresholds = more groups
-        n_clusters = []
-        
-        # Also track silhouette scores to help find good clustering
         from sklearn.metrics import silhouette_score
-        silhouette_scores = []
         
-        for threshold in thresholds:
+        # Get unique malware types
+        unique_types = set(self.malware_types[f] for f in malware_families)
+        min_clusters = len(unique_types)  # At least one cluster per malware type
+        
+        # Test range of cluster numbers
+        n_cluster_range = range(min_clusters, min_clusters + 20, 2)
+        scores = []
+        clustering_results = []
+        
+        logger.info("\nTesting different numbers of clusters:")
+        for n_clusters in n_cluster_range:
             clustering = AgglomerativeClustering(
-                n_clusters=None,
-                distance_threshold=threshold,
+                n_clusters=n_clusters,
                 metric='precomputed',
-                linkage='average'  # Changed from complete to average - less conservative
+                linkage='average'
             )
-            labels = clustering.fit_predict(distance_matrix)
-            n_clusters_i = len(set(labels))
-            n_clusters.append(n_clusters_i)
             
-            # Only compute silhouette score if we have more than 1 cluster
-            if n_clusters_i > 1:
-                try:
-                    score = silhouette_score(distance_matrix, labels, metric='precomputed')
-                    silhouette_scores.append(score)
-                except:
-                    silhouette_scores.append(-1)
+            labels = clustering.fit_predict(distance_matrix)
+            
+            # Check if clustering maintains malware type constraint
+            is_valid = True
+            for cluster_id in range(n_clusters):
+                cluster_families = [malware_families[i] for i, l in enumerate(labels) if l == cluster_id]
+                cluster_types = set(self.malware_types[f] for f in cluster_families)
+                if len(cluster_types) > 1:
+                    is_valid = False
+                    break
+            
+            if is_valid:
+                sil_score = silhouette_score(distance_matrix, labels, metric='precomputed')
+                scores.append(sil_score)
+                clustering_results.append(labels)
+                logger.info(f"n_clusters={n_clusters}, silhouette={sil_score:.3f}")
             else:
-                silhouette_scores.append(-1)
+                scores.append(-1)  # Invalid clustering
+                clustering_results.append(None)
+                logger.info(f"n_clusters={n_clusters}, invalid - mixed malware types")
         
-        # Find a good threshold that balances number of clusters and cluster quality
-        scores = np.array(silhouette_scores)
-        n_clusters = np.array(n_clusters)
+        # Find best valid clustering
+        valid_scores = [(i, s) for i, s in enumerate(scores) if s > -1]
+        if not valid_scores:
+            raise ValueError("No valid clustering found that maintains malware type constraints")
+            
+        best_idx = max(valid_scores, key=lambda x: x[1])[0]
+        best_n_clusters = list(n_cluster_range)[best_idx]
+        best_score = scores[best_idx]
+        best_labels = clustering_results[best_idx]
         
-        # Filter for reasonable numbers of clusters (e.g., between 10 and 100)
-        valid_indices = (n_clusters >= 10) & (n_clusters <= 100)
-        if not any(valid_indices):
-            # If no threshold gives us desired range, pick one that gives ~50 clusters
-            target_clusters = 50
-            idx = np.argmin(np.abs(n_clusters - target_clusters))
-            return thresholds[idx]
+        logger.info(f"\nBest clustering: n_clusters={best_n_clusters}, silhouette={best_score:.3f}")
         
-        # Among valid thresholds, pick one with good silhouette score
-        valid_scores = scores[valid_indices]
-        valid_thresholds = thresholds[valid_indices]
-        
-        if len(valid_scores) > 0:
-            # Pick threshold with best score
-            best_idx = np.argmax(valid_scores)
-            return valid_thresholds[best_idx]
-        
-        return 0.3  # Fallback threshold
+        return best_labels, best_score
+
 def main():
     # Initialize processor
     aggregator = MalwareBehaviorAggregator(
