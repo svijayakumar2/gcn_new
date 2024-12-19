@@ -150,71 +150,112 @@ class TemporalCentroidTrainer:
     def __init__(self, model, device):
         self.model = model
         self.device = device
-        self.prototypes = {}  # Family -> designated prototype embedding
+        self.prototypes = {}  # Family -> centroid embedding
         self.prototype_updates = defaultdict(int)
         self.margin = 0.3
         self.confidence_threshold = 0.7
+        # Track moving statistics for distance thresholding
+        self.distance_stats = {
+            'mean': None,
+            'std': None,
+            'n_updates': 0
+        }
         
-    def set_prototype(self, family, embedding):
-        """Set or update the prototype for a family"""
-        family_str = str(family)
-        print(f"Setting/updating prototype for family {family_str}")  # Debug print
+    def update_distance_stats(self, distances):
+        """Update running statistics for distance-based thresholding"""
+        batch_mean = distances.mean().item()
+        batch_std = distances.std().item()
         
-        if family_str not in self.prototypes:
-            print(f"Creating new prototype for family {family_str}")  # Debug print
-            self.prototypes[family_str] = embedding.detach()
+        if self.distance_stats['mean'] is None:
+            self.distance_stats['mean'] = batch_mean
+            self.distance_stats['std'] = batch_std
         else:
-            momentum = 0.9
-            self.prototypes[family_str] = momentum * self.prototypes[family_str] + (1 - momentum) * embedding.detach()
-            print(f"Updated prototype for family {family_str}")  # Debug print
+            # Exponential moving average
+            alpha = 0.1
+            self.distance_stats['mean'] = (1 - alpha) * self.distance_stats['mean'] + alpha * batch_mean
+            self.distance_stats['std'] = (1 - alpha) * self.distance_stats['std'] + alpha * batch_std
         
-        self.prototype_updates[family_str] += 1
-    
+        self.distance_stats['n_updates'] += 1
+
+    def update_prototypes(self, embeddings, families):
+        """Update prototype centroids for each family in batch"""
+        unique_families = torch.unique(families)
+        
+        for family in unique_families:
+            family_str = str(family.item())
+            family_mask = (families == family)
+            family_embeddings = embeddings[family_mask]
+            
+            # Compute new centroid for this family
+            new_centroid = family_embeddings.mean(dim=0)
+            
+            if family_str not in self.prototypes:
+                self.prototypes[family_str] = new_centroid.detach()
+            else:
+                # Exponential moving average update
+                momentum = 0.9
+                old_centroid = self.prototypes[family_str]
+                updated_centroid = momentum * old_centroid + (1 - momentum) * new_centroid
+                self.prototypes[family_str] = updated_centroid.detach()
+            
+            self.prototype_updates[family_str] += 1
+
+    def compute_distances(self, embeddings):
+        """Compute distances between embeddings and all prototypes"""
+        if not self.prototypes:
+            return None, None
+            
+        prototype_tensor = torch.stack(list(self.prototypes.values())).to(self.device)
+        
+        # Compute cosine distances
+        similarities = torch.matmul(embeddings, prototype_tensor.T)
+        distances = 1 - similarities  # Convert to distances
+        
+        return distances, list(self.prototypes.keys())
+
     def train_batch(self, batch, phase):
         self.model.train()
         batch = batch.to(self.device)
-        embeddings = self.model(batch)
+        embeddings = self.model(batch)  # [batch_size, embedding_dim]
         
-        print(f"Batch size: {len(batch.y)}")
-        print(f"Number of prototypes: {len(self.prototypes)}")
-        print(f"Unique families in batch: {torch.unique(batch.y).tolist()}")  # Debug print
+        # Normalize embeddings
+        embeddings = F.normalize(embeddings, p=2, dim=1)
         
-        loss = torch.tensor(0.0, device=self.device, requires_grad=True)
-        batch_size = embeddings.size(0)
+        # Update prototypes with new embeddings
+        self.update_prototypes(embeddings, batch.y)
         
-        # First, update all prototypes for this batch
+        # Compute distances to all prototypes
+        distances, prototype_families = self.compute_distances(embeddings)
+        if distances is None:
+            return torch.tensor(0.0, device=self.device)
+        
+        # Update distance statistics
+        self.update_distance_stats(distances)
+        
+        # Compute loss
+        loss = torch.tensor(0.0, device=self.device)
+        
         for i, (emb, family) in enumerate(zip(embeddings, batch.y)):
             family_str = str(family.item())
-            print(f"Processing sample {i}, family: {family_str}")  # Debug print
-            self.set_prototype(family_str, emb)
-        
-        # Now compute loss using updated prototypes
-        prototype_families = list(self.prototypes.keys())
-        
-        if prototype_families:  # Only if we have prototypes
-            prototype_tensor = torch.stack([self.prototypes[f] for f in prototype_families])
-            similarities = torch.matmul(embeddings, prototype_tensor.T)
             
-            for i, (emb, family) in enumerate(zip(embeddings, batch.y)):
-                family_str = str(family.item())
+            if family_str in prototype_families:
                 prototype_idx = prototype_families.index(family_str)
-                pos_sim = similarities[i, prototype_idx]
                 
-                # Get negative similarities
-                neg_indices = [j for j in range(len(prototype_families)) if j != prototype_idx]
-                if neg_indices:
-                    neg_sim = similarities[i, neg_indices]
-                    cur_loss = (-pos_sim + torch.logsumexp(neg_sim, dim=0))
-                    print(f"Sample {i} loss: {cur_loss.item()}")  # Debug print
-                    loss = loss + cur_loss
+                # Positive pair loss
+                pos_dist = distances[i, prototype_idx]
+                
+                # Negative pair losses (to all other prototypes)
+                neg_mask = torch.ones(len(prototype_families), dtype=torch.bool, device=self.device)
+                neg_mask[prototype_idx] = False
+                neg_dists = distances[i, neg_mask]
+                
+                # Contrastive loss with margin
+                neg_loss = torch.max(torch.zeros_like(neg_dists), self.margin - neg_dists)
+                loss += pos_dist + neg_loss.mean()
         
-        avg_loss = loss / max(1, batch_size)
-        print(f"Average batch loss: {avg_loss.item()}")  # Debug print
-        return avg_loss
-    
+        return loss / len(batch)
 
     def evaluate(self, batch, phase):
-        """Evaluate with separate metrics for new and existing families"""
         self.model.eval()
         batch = batch.to(self.device)
         
@@ -226,42 +267,39 @@ class TemporalCentroidTrainer:
         
         with torch.no_grad():
             embeddings = self.model(batch)
+            embeddings = F.normalize(embeddings, p=2, dim=1)
             
-            if not self.prototypes:
+            # Get distances to prototypes
+            distances, prototype_families = self.compute_distances(embeddings)
+            if distances is None:
                 return metrics
-                
-            # Convert prototypes to tensor once
-            prototype_families = list(self.prototypes.keys())
-            prototype_tensor = torch.stack([self.prototypes[f] for f in prototype_families])
             
-            # Compute all similarities at once
-            similarities = torch.matmul(embeddings, prototype_tensor.T)  # [batch_size, num_prototypes]
+            # Compute dynamic threshold for new family detection
+            threshold = (self.distance_stats['mean'] + 
+                       2 * self.distance_stats['std'])  # 2 sigma threshold
             
-            for i, (emb, true_family) in enumerate(zip(embeddings, batch.y)):
+            for i, (_, true_family) in enumerate(zip(embeddings, batch.y)):
                 true_family_str = str(true_family.item())
+                min_dist, pred_idx = distances[i].min(dim=0)
                 
-                # Get best matching prototype
-                best_sim, best_idx = similarities[i].max(dim=0)
-                predicted_family = prototype_families[best_idx.item()]
-                confidence = best_sim.item()
-                
-                # Determine if this is a new family
-                is_new_family = true_family_str not in self.prototypes
+                # Check if this is a new family
+                is_new_family = true_family_str not in prototype_families
                 
                 if is_new_family:
                     metrics['new']['total'] += 1
-                    # For new families, count as correct if confidence is low
-                    if confidence < self.confidence_threshold:
+                    # Consider it correct if distance is above threshold
+                    if min_dist > threshold:
                         metrics['new']['correct'] += 1
                 else:
                     metrics['existing']['total'] += 1
-                    if predicted_family == true_family_str and confidence >= self.confidence_threshold:
+                    predicted_family = prototype_families[pred_idx]
+                    if predicted_family == true_family_str and min_dist <= threshold:
                         metrics['existing']['correct'] += 1
                 
-                # Track per-family metrics
+                # Update per-family metrics
                 metrics['per_family'][true_family_str]['total'] += 1
-                if (is_new_family and confidence < self.confidence_threshold) or \
-                   (not is_new_family and predicted_family == true_family_str and confidence >= self.confidence_threshold):
+                if (is_new_family and min_dist > threshold) or \
+                   (not is_new_family and predicted_family == true_family_str and min_dist <= threshold):
                     metrics['per_family'][true_family_str]['correct'] += 1
         
         return metrics
