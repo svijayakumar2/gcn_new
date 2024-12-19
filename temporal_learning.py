@@ -10,6 +10,8 @@ import numpy as np
 from architectures import PhasedGNN, PhasedTraining
 from torch_geometric.nn import GCNConv, global_mean_pool
 import torch.nn.functional as F
+import torch.nn.functional as F
+from torch_geometric.nn import GATConv, GraphNorm
 
 
 # Configure logging
@@ -20,58 +22,124 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 class ImprovedGNN(torch.nn.Module):
-    def __init__(self, num_node_features, hidden_dim=128, embedding_dim=64):
+    def __init__(self, num_node_features, hidden_dim=256, embedding_dim=128):
         super().__init__()
-        # Multiple GNN layers with residual connections
-        self.conv1 = GCNConv(num_node_features, hidden_dim)
+        # Initial feature processing
+        self.feat_encoder = torch.nn.Sequential(
+            torch.nn.Linear(num_node_features, hidden_dim),
+            torch.nn.LayerNorm(hidden_dim),
+            torch.nn.ReLU(),
+            torch.nn.Dropout(0.2)
+        )
+        
+        # GNN layers
+        self.conv1 = GCNConv(hidden_dim, hidden_dim)
         self.conv2 = GCNConv(hidden_dim, hidden_dim)
         self.conv3 = GCNConv(hidden_dim, hidden_dim)
         
-        # Batch normalization layers
-        self.bn1 = torch.nn.BatchNorm1d(hidden_dim)
-        self.bn2 = torch.nn.BatchNorm1d(hidden_dim)
-        self.bn3 = torch.nn.BatchNorm1d(hidden_dim)
+        # Normalization layers
+        self.norm1 = torch.nn.LayerNorm(hidden_dim)
+        self.norm2 = torch.nn.LayerNorm(hidden_dim)
+        self.norm3 = torch.nn.LayerNorm(hidden_dim)
         
-        # Projection layers
-        self.fc1 = torch.nn.Linear(hidden_dim, hidden_dim)
-        self.fc2 = torch.nn.Linear(hidden_dim, embedding_dim)
+        # Attention weights
+        self.attention = torch.nn.Sequential(
+            torch.nn.Linear(hidden_dim, 1),
+            torch.nn.Tanh()
+        )
         
-        self.dropout = torch.nn.Dropout(0.2)
+        # Final projection layers
+        self.projection = torch.nn.Sequential(
+            torch.nn.Linear(hidden_dim, hidden_dim),
+            torch.nn.LayerNorm(hidden_dim),
+            torch.nn.ReLU(),
+            torch.nn.Dropout(0.2),
+            torch.nn.Linear(hidden_dim, embedding_dim)
+        )
         
     def forward(self, data):
         x, edge_index = data.x, data.edge_index
+        batch = data.batch if hasattr(data, 'batch') else torch.zeros(x.size(0), dtype=torch.long, device=x.device)
         
-        # First GNN layer
-        x1 = self.conv1(x, edge_index)
-        x1 = self.bn1(x1)
-        x1 = F.leaky_relu(x1)
-        x1 = self.dropout(x1)
+        # Initial feature processing
+        x = self.feat_encoder(x)
         
-        # Second GNN layer with residual
-        x2 = self.conv2(x1, edge_index)
-        x2 = self.bn2(x2)
-        x2 = F.leaky_relu(x2)
-        x2 = self.dropout(x2)
-        x2 = x2 + x1  # Residual connection
+        # GNN layers with residual connections
+        x1 = F.relu(self.norm1(self.conv1(x, edge_index)))
+        x2 = F.relu(self.norm2(self.conv2(x1, edge_index))) + x1
+        x3 = F.relu(self.norm3(self.conv3(x2, edge_index))) + x2
         
-        # Third GNN layer with residual
-        x3 = self.conv3(x2, edge_index)
-        x3 = self.bn3(x3)
-        x3 = F.leaky_relu(x3)
-        x3 = x3 + x2  # Residual connection
+        # Attention-based pooling (replacing scatter operations)
+        attention_weights = self.attention(x3)
+        attention_weights = F.softmax(attention_weights, dim=0)
         
-        # Global pooling with attention
-        batch = data.batch if hasattr(data, 'batch') else torch.zeros(data.x.size(0), dtype=torch.long, device=x.device)
-        x = global_mean_pool(x3, batch)
+        # Manual pooling by batch
+        max_batch = int(batch.max().item() + 1)
+        pooled = []
         
-        # Final projection
-        x = self.fc1(x)
-        x = F.leaky_relu(x)
-        x = self.dropout(x)
-        x = self.fc2(x)
+        for b in range(max_batch):
+            mask = (batch == b)
+            if mask.any():
+                # Weight and sum the nodes for this graph
+                batch_nodes = x3[mask]
+                batch_weights = attention_weights[mask]
+                pooled.append((batch_nodes * batch_weights).sum(dim=0))
         
-        return F.normalize(x, p=2, dim=1)  # L2 normalize embeddings
-    
+        if pooled:
+            x = torch.stack(pooled)
+        else:
+            # Fallback if batch is empty
+            x = x3.mean(dim=0, keepdim=True)
+        
+        # Project to embedding space
+        x = self.projection(x)
+        return F.normalize(x, p=2, dim=1)
+
+def load_batch(batch_file, family_to_idx, batch_size=32, device='cpu'):
+    """Load and preprocess a single batch file."""
+    try:
+        if not os.path.exists(batch_file):
+            logger.warning(f"Batch file not found: {batch_file}")
+            return None
+            
+        batch = torch.load(batch_file)
+        processed = []
+        
+        for graph in batch:
+            try:
+                # Skip empty graphs
+                if graph.edge_index.size(1) == 0:
+                    logger.debug(f"Skipping empty graph")
+                    continue
+                    
+                # Process family label
+                family = getattr(graph, 'family', 'none')
+                if not family or family == '':
+                    family = 'none'
+                if family not in family_to_idx:
+                    family = 'none'
+                    
+                # Set label and move tensors to device
+                graph.y = torch.tensor(family_to_idx[family]).to(device)
+                graph.x = graph.x.to(device)
+                graph.edge_index = graph.edge_index.to(device)
+                graph.edge_attr = graph.edge_attr.to(device)
+                
+                processed.append(graph)
+                
+            except Exception as e:
+                logger.error(f"Error processing graph: {str(e)}")
+                continue
+                
+        if not processed:
+            return None
+            
+        return DataLoader(processed, batch_size=batch_size, shuffle=False)
+        
+    except Exception as e:
+        logger.error(f"Error loading batch {batch_file}: {str(e)}")
+        return None
+
 
 def calculate_temporal_weight(timestamp, current_time, decay_factor=0.1):
     """Calculate weight based on temporal distance."""
@@ -82,161 +150,154 @@ class TemporalCentroidTrainer:
     def __init__(self, model, device):
         self.model = model
         self.device = device
-        self.centroids = {}
-        self.sample_counts = defaultdict(int)
-        self.momentum = 0.9
-        self.min_samples = 2
+        self.prototypes = {}  # Family -> designated prototype embedding
+        self.prototype_updates = defaultdict(int)
         self.margin = 0.3
-        self.confidence_threshold = 0.6
-
+        self.confidence_threshold = 0.7
+        
+    def set_prototype(self, family, embedding):
+        """Set or update the prototype for a family"""
+        family_str = str(family)
+        print(f"Setting/updating prototype for family {family_str}")  # Debug print
+        
+        if family_str not in self.prototypes:
+            print(f"Creating new prototype for family {family_str}")  # Debug print
+            self.prototypes[family_str] = embedding.detach()
+        else:
+            momentum = 0.9
+            self.prototypes[family_str] = momentum * self.prototypes[family_str] + (1 - momentum) * embedding.detach()
+            print(f"Updated prototype for family {family_str}")  # Debug print
+        
+        self.prototype_updates[family_str] += 1
+    
     def train_batch(self, batch, phase):
         self.model.train()
         batch = batch.to(self.device)
         embeddings = self.model(batch)
         
-        loss = 0
+        print(f"Batch size: {len(batch.y)}")
+        print(f"Number of prototypes: {len(self.prototypes)}")
+        print(f"Unique families in batch: {torch.unique(batch.y).tolist()}")  # Debug print
+        
+        loss = torch.tensor(0.0, device=self.device, requires_grad=True)
         batch_size = embeddings.size(0)
         
+        # First, update all prototypes for this batch
         for i, (emb, family) in enumerate(zip(embeddings, batch.y)):
             family_str = str(family.item())
-            self.sample_counts[family_str] += 1
+            print(f"Processing sample {i}, family: {family_str}")  # Debug print
+            self.set_prototype(family_str, emb)
+        
+        # Now compute loss using updated prototypes
+        prototype_families = list(self.prototypes.keys())
+        
+        if prototype_families:  # Only if we have prototypes
+            prototype_tensor = torch.stack([self.prototypes[f] for f in prototype_families])
+            similarities = torch.matmul(embeddings, prototype_tensor.T)
             
-            # Dynamic momentum based on sample count
-            momentum = min(0.99, self.momentum + 0.1 * (1.0 - 1.0/self.sample_counts[family_str]))
-            
-            # Update centroid with dynamic momentum
-            if family_str not in self.centroids:
-                self.centroids[family_str] = emb.detach()
-            else:
-                self.centroids[family_str] = (
-                    momentum * self.centroids[family_str] + 
-                    (1 - momentum) * emb.detach()
-                )
-            
-            # Enhanced contrastive loss
-            anchor = emb
-            positive = self.centroids[family_str]
-            
-            # Weighted positive distance based on sample count
-            pos_weight = 1.0 / np.sqrt(self.sample_counts[family_str])
-            pos_dist = pos_weight * (1 - F.cosine_similarity(anchor, positive.unsqueeze(0)))
-            
-            # Hard negative mining
-            neg_dists = []
-            for other_family, other_centroid in self.centroids.items():
-                if other_family != family_str:
-                    neg_dist = 1 - F.cosine_similarity(anchor, other_centroid.unsqueeze(0))
-                    neg_dists.append(neg_dist)
-            
-            if neg_dists:
-                # Use top-k hardest negatives
-                k = min(3, len(neg_dists))
-                hardest_negs = sorted(neg_dists)[:k]
-                neg_loss = sum(max(0, self.margin - neg_dist) for neg_dist in hardest_negs) / k
-                loss += pos_dist + neg_loss
-
-        return loss.item() / batch_size if batch_size > 0 else 0.0
+            for i, (emb, family) in enumerate(zip(embeddings, batch.y)):
+                family_str = str(family.item())
+                prototype_idx = prototype_families.index(family_str)
+                pos_sim = similarities[i, prototype_idx]
+                
+                # Get negative similarities
+                neg_indices = [j for j in range(len(prototype_families)) if j != prototype_idx]
+                if neg_indices:
+                    neg_sim = similarities[i, neg_indices]
+                    cur_loss = (-pos_sim + torch.logsumexp(neg_sim, dim=0))
+                    print(f"Sample {i} loss: {cur_loss.item()}")  # Debug print
+                    loss = loss + cur_loss
+        
+        avg_loss = loss / max(1, batch_size)
+        print(f"Average batch loss: {avg_loss.item()}")  # Debug print
+        return avg_loss
+    
 
     def evaluate(self, batch, phase):
+        """Evaluate with separate metrics for new and existing families"""
         self.model.eval()
         batch = batch.to(self.device)
         
+        metrics = {
+            'existing': {'correct': 0, 'total': 0},
+            'new': {'correct': 0, 'total': 0},
+            'per_family': defaultdict(lambda: {'correct': 0, 'total': 0})
+        }
+        
         with torch.no_grad():
             embeddings = self.model(batch)
-            correct = 0
-            total = len(batch)
             
-            for emb, true_family in zip(embeddings, batch.y):
-                true_family = str(true_family.item())
+            if not self.prototypes:
+                return metrics
                 
-                # Calculate similarities with confidence scores
-                similarities = []
-                for family, centroid in self.centroids.items():
-                    sim = F.cosine_similarity(emb, centroid.unsqueeze(0))
-                    # Adjust similarity based on sample count
-                    confidence = sim * (1 + np.log(self.sample_counts[family]))
-                    similarities.append((family, confidence))
+            # Convert prototypes to tensor once
+            prototype_families = list(self.prototypes.keys())
+            prototype_tensor = torch.stack([self.prototypes[f] for f in prototype_families])
+            
+            # Compute all similarities at once
+            similarities = torch.matmul(embeddings, prototype_tensor.T)  # [batch_size, num_prototypes]
+            
+            for i, (emb, true_family) in enumerate(zip(embeddings, batch.y)):
+                true_family_str = str(true_family.item())
                 
-                if not similarities:
-                    continue
+                # Get best matching prototype
+                best_sim, best_idx = similarities[i].max(dim=0)
+                predicted_family = prototype_families[best_idx.item()]
+                confidence = best_sim.item()
                 
-                # Find best match with confidence threshold
-                similarities.sort(key=lambda x: x[1], reverse=True)
-                best_family, confidence = similarities[0]
+                # Determine if this is a new family
+                is_new_family = true_family_str not in self.prototypes
                 
-                if confidence > self.confidence_threshold:
-                    if best_family == true_family:
-                        correct += 1
+                if is_new_family:
+                    metrics['new']['total'] += 1
+                    # For new families, count as correct if confidence is low
+                    if confidence < self.confidence_threshold:
+                        metrics['new']['correct'] += 1
                 else:
-                    # Consider new family prediction
-                    if true_family not in self.centroids or self.sample_counts[true_family] < self.min_samples:
-                        correct += 1
-            
-            return correct, total, correct/total if total > 0 else 0.0
-    # def __init__(self, model, device):
-    #     self.model = model
-    #     self.device = device
-    #     self.centroids = {}  # Family -> centroid mapping
-    #     self.temporal_weights = {}  # Family -> timestamp mapping
-
-    # def train_batch(self, batch, phase):
-    #     """Similar interface to your existing PhasedTraining.train_batch()"""
-    #     self.model.train()
-    #     batch = batch.to(self.device)
-    #     embeddings = self.model(batch)
+                    metrics['existing']['total'] += 1
+                    if predicted_family == true_family_str and confidence >= self.confidence_threshold:
+                        metrics['existing']['correct'] += 1
+                
+                # Track per-family metrics
+                metrics['per_family'][true_family_str]['total'] += 1
+                if (is_new_family and confidence < self.confidence_threshold) or \
+                   (not is_new_family and predicted_family == true_family_str and confidence >= self.confidence_threshold):
+                    metrics['per_family'][true_family_str]['correct'] += 1
         
-    #     loss = 0
-    #     for i, (emb, family) in enumerate(zip(embeddings, batch.y)):
-    #         family_str = str(family.item())
-            
-    #         # Update or initialize centroid
-    #         if family_str not in self.centroids:
-    #             self.centroids[family_str] = emb.detach()
-    #         else:
-    #             # Temporal update (keeping your data structure)
-    #             old_weight = 0.7
-    #             self.centroids[family_str] = (old_weight * self.centroids[family_str] + 
-    #                                         (1-old_weight) * emb.detach())
-            
-    #         # Contrastive loss calculation
-    #         pos_dist = F.cosine_similarity(emb, self.centroids[family_str].unsqueeze(0))
-    #         neg_dists = []
-    #         for f, c in self.centroids.items():
-    #             if f != family_str:
-    #                 neg_dists.append(F.cosine_similarity(emb, c.unsqueeze(0)))
-            
-    #         if neg_dists:
-    #             loss += -pos_dist + torch.stack(neg_dists).mean()
+        return metrics
 
-    #     return loss.item() / len(batch)
-
-    # def evaluate(self, batch, phase):
-    #     """Keep similar interface to your PhasedTraining.evaluate()"""
-    #     self.model.eval()
-    #     batch = batch.to(self.device)
+def print_eval_metrics(metrics):
+    """Print evaluation metrics with family details"""
+    print("\n=== Evaluation Results ===")
+    
+    # Print overall metrics
+    if metrics['existing']['total'] > 0:
+        existing_acc = metrics['existing']['correct'] / metrics['existing']['total']
+        print(f"\nExisting Families: {existing_acc:.2%} ({metrics['existing']['correct']}/{metrics['existing']['total']})")
+    
+    if metrics['new']['total'] > 0:
+        new_acc = metrics['new']['correct'] / metrics['new']['total']
+        print(f"New Families: {new_acc:.2%} ({metrics['new']['correct']}/{metrics['new']['total']})")
+    
+    # Print per-family details
+    print("\nPer-family Performance (min 5 samples):")
+    family_stats = []
+    for family, stats in metrics['per_family'].items():
+        if stats['total'] >= 5:
+            acc = stats['correct'] / stats['total']
+            family_stats.append((family, acc, stats['total']))
+    
+    # Sort by accuracy
+    family_stats.sort(key=lambda x: x[1], reverse=True)
+    
+    # Print top and bottom 5
+    print("\nTop 5 Performing Families:")
+    for family, acc, total in family_stats[:5]:
+        print(f"Family {family}: {acc:.2%} ({total} samples)")
         
-    #     with torch.no_grad():
-    #         embeddings = self.model(batch)
-    #         correct = 0
-    #         total = len(batch)
-            
-    #         for emb, true_family in zip(embeddings, batch.y):
-    #             true_family = str(true_family.item())
-                
-    #             # Find closest centroid
-    #             best_dist = float('-inf')
-    #             best_family = None
-                
-    #             for family, centroid in self.centroids.items():
-    #                 dist = F.cosine_similarity(emb, centroid.unsqueeze(0))
-    #                 if dist > best_dist:
-    #                     best_dist = dist
-    #                     best_family = family
-                
-    #             if best_family == true_family:
-    #                 correct += 1
-            
-    #         return correct, total, correct/total
+    print("\nBottom 5 Performing Families:")
+    for family, acc, total in family_stats[-5:]:
+        print(f"Family {family}: {acc:.2%} ({total} samples)")
         
 def prepare_data(base_dir='bodmas_batches'):
     """Prepare datasets with temporal ordering."""
@@ -298,50 +359,7 @@ def prepare_data(base_dir='bodmas_batches'):
         json.dump(mapping, f, indent=2)
     return split_files, len(families), family_to_idx
 
-def load_batch(batch_file, family_to_idx, batch_size=32, device='cpu'):
-    """Load and preprocess a single batch file."""
-    try:
-        if not os.path.exists(batch_file):
-            logger.warning(f"Batch file not found: {batch_file}")
-            return None
-            
-        batch = torch.load(batch_file)
-        processed = []
-        
-        for graph in batch:
-            try:
-                # Process family label
-                family = getattr(graph, 'family', 'none')
-                if not family or family == '':
-                    family = 'none'
-                if family not in family_to_idx:
-                    family = 'none'
-                    
-                # Set label and move tensors to device
-                graph.y = torch.tensor(family_to_idx[family]).to(device)
-                graph.x = graph.x.to(device)
-                graph.edge_index = graph.edge_index.to(device)
-                
-                # Handle edge attributes
-                if graph.edge_index.size(1) == 0:
-                    graph.edge_attr = torch.zeros((0, 1)).to(device)
-                else:
-                    graph.edge_attr = torch.ones((graph.edge_index.size(1), 1)).to(device)
-                    
-                processed.append(graph)
-                
-            except Exception as e:
-                logger.error(f"Error processing graph: {str(e)}")
-                continue
-                
-        if not processed:
-            return None
-            
-        return DataLoader(processed, batch_size=batch_size, shuffle=False)
-        
-    except Exception as e:
-        logger.error(f"Error loading batch {batch_file}: {str(e)}")
-        return None
+
 
 def train_epoch(trainer, split_files, family_to_idx, phase, device):
     """Train for one epoch."""
@@ -362,13 +380,12 @@ def train_epoch(trainer, split_files, family_to_idx, phase, device):
 
 
 def evaluate(trainer, split_files, family_to_idx, phase, device):
-    """Evaluate on a split with weighted metrics."""
-    family_correct = defaultdict(int)
-    family_total = defaultdict(int)
-    total_correct = 0
-    total_preds = 0
-    recall_sum = 0
-    num_batches = 0
+    """Evaluate model performance"""
+    total_metrics = {
+        'existing': {'correct': 0, 'total': 0},
+        'new': {'correct': 0, 'total': 0},
+        'per_family': defaultdict(lambda: {'correct': 0, 'total': 0})
+    }
     
     for batch_file in split_files:
         loader = load_batch(batch_file, family_to_idx, device=device)
@@ -376,33 +393,21 @@ def evaluate(trainer, split_files, family_to_idx, phase, device):
             continue
             
         for batch in loader:
-            correct, total, recall = trainer.evaluate(batch, phase)
-            total_correct += correct
-            total_preds += total
-            recall_sum += recall
-            num_batches += 1
+            # Get batch metrics from trainer
+            batch_metrics = trainer.evaluate(batch, phase)
             
-            # Track results per family
-            for fam in batch.y:
-                family_total[fam.item()] += 1
-
-    # Calculate regular precision
-    precision = total_correct / max(1, total_preds)
+            # Accumulate metrics
+            total_metrics['existing']['correct'] += batch_metrics['existing']['correct']
+            total_metrics['existing']['total'] += batch_metrics['existing']['total']
+            total_metrics['new']['correct'] += batch_metrics['new']['correct']
+            total_metrics['new']['total'] += batch_metrics['new']['total']
+            
+            # Accumulate per-family metrics
+            for family, stats in batch_metrics['per_family'].items():
+                total_metrics['per_family'][family]['correct'] += stats['correct']
+                total_metrics['per_family'][family]['total'] += stats['total']
     
-    # Calculate weighted precision
-    weighted_precision = 0
-    total_samples = sum(family_total.values())
-    
-    if total_samples > 0:
-        for family, count in family_total.items():
-            weight = count / total_samples
-            weighted_precision += precision * weight  # Using overall precision as an approximation
-
-    # Keep original return format
-    return precision, recall_sum / max(1, num_batches)
-
-
-
+    return total_metrics
 
 
 
@@ -410,118 +415,120 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     logger.info(f"Using device: {device}")
     
-    # Load data using your existing prepare_data
     split_files, num_families, family_to_idx = prepare_data()
-    
-    # Get feature dimensions
     first_batch = torch.load(split_files['train'][0])
     num_features = first_batch[0].x.size(1)
     
-    # Initialize improved model and trainer
     model = ImprovedGNN(
         num_node_features=num_features,
-        hidden_dim=256,  # Increased capacity
-        embedding_dim=128  # Increased embedding dimension
+        hidden_dim=256,
+        embedding_dim=128
     ).to(device)
     
     trainer = TemporalCentroidTrainer(model, device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.001, weight_decay=0.02)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.5)
     
-    # Use AdamW with weight decay
-    optimizer = torch.optim.AdamW(model.parameters(), lr=0.001, weight_decay=0.01)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', 
-                                                         factor=0.5, patience=2)
+    best_metrics = {
+        'existing_acc': 0.0,
+        'new_acc': 0.0,
+        'combined_acc': 0.0
+    }
+    epochs = 20
     
-    best_precision = 0
-    epochs = 20  # Increase epochs
-    
+    logger.info("Starting training...")
+    logger.info(f"Total families in dataset: {num_families}")
+        # In main(), before the training loop:
+    print("Checking data splits:")
+    for split in ['train', 'val', 'test']:
+        if split in split_files:
+            print(f"{split} files: {len(split_files[split])}")
+            # Load first batch as a test
+            first_file = split_files[split][0]
+            test_batch = load_batch(first_file, family_to_idx, device=device)
+            if test_batch is not None:
+                for batch in test_batch:
+                    print(f"First {split} batch size: {len(batch.y)}")
+                    print(f"Unique families in batch: {len(torch.unique(batch.y))}")
+                    break
+        
     for epoch in range(epochs):
+        print(f"\n=== Starting Epoch {epoch+1} ===")
         # Train
         model.train()
-        loss = train_epoch(trainer, split_files['train'], family_to_idx, 'centroid', device)
+        total_loss = 0
+        num_batches = 0
+        
+        print(f"Training files: {len(split_files['train'])}")  # Debug print
+        
+        for batch_idx, batch_file in enumerate(split_files['train']):
+            print(f"\nProcessing batch file {batch_idx+1}/{len(split_files['train'])}")  # Debug print
+            loader = load_batch(batch_file, family_to_idx, device=device)
+            if not loader:
+                print(f"Skipped batch file {batch_idx+1} - no valid data")  # Debug print
+                continue   
+    
+
+            
+            for batch in loader:
+                optimizer.zero_grad()
+                loss = trainer.train_batch(batch, 'train')
+                loss.backward()
+                optimizer.step()
+                total_loss += loss.item()  # Convert loss to float here
+                num_batches += 1
+        
+        avg_loss = total_loss / max(1, num_batches)
         
         # Validate
         model.eval()
-        precision, recall = evaluate(trainer, split_files['val'], 
-                                   family_to_idx, 'centroid', device)
+        val_metrics = evaluate(trainer, split_files['val'], family_to_idx, 'val', device)
         
-        # Learning rate scheduling
-        scheduler.step(precision)
+        # Calculate accuracies
+        existing_acc = (val_metrics['existing']['correct'] / val_metrics['existing']['total'] 
+                       if val_metrics['existing']['total'] > 0 else 0)
+        new_acc = (val_metrics['new']['correct'] / val_metrics['new']['total'] 
+                  if val_metrics['new']['total'] > 0 else 0)
+        total_samples = val_metrics['existing']['total'] + val_metrics['new']['total']
+        total_correct = val_metrics['existing']['correct'] + val_metrics['new']['correct']
+        combined_acc = total_correct / total_samples if total_samples > 0 else 0
         
-        logger.info(f"Epoch {epoch}: loss={loss:.4f}, "
-                   f"precision={precision:.4f}, recall={recall:.4f}")
+        # Print epoch results
+        print(f"\n=== Epoch {epoch+1}/{epochs} ===")
+        print(f"Training Loss: {avg_loss:.4f}")
+        print(f"Learning Rate: {scheduler.get_last_lr()[0]:.6f}")
+        print(f"\nValidation Results:")
+        print(f"Existing Families: {existing_acc:.2%} ({val_metrics['existing']['correct']}/{val_metrics['existing']['total']})")
+        print(f"New Families: {new_acc:.2%} ({val_metrics['new']['correct']}/{val_metrics['new']['total']})")
+        print(f"Combined Accuracy: {combined_acc:.2%}")
         
-        # Save best model
-        if precision > best_precision:
-            best_precision = precision
-            # Save model as before
+        scheduler.step()
+        
+        # Save best model based on combined accuracy
+        if combined_acc > best_metrics['combined_acc']:
+            best_metrics = {
+                'existing_acc': existing_acc,
+                'new_acc': new_acc,
+                'combined_acc': combined_acc,
+                'epoch': epoch + 1
+            }
+            
             save_dir = "trained_model"
             os.makedirs(save_dir, exist_ok=True)
-            
-            model_path = os.path.join(save_dir, "centroid_gnn_final.pt")
-            mapping_path = os.path.join(save_dir, "family_mapping.json")
-            
-            # Save model, centroids, and mapping
             torch.save({
                 'model_state_dict': model.state_dict(),
-                'centroids': trainer.centroids,
-                'num_features': num_features,
-                'num_families': num_families,
-            }, model_path)
-            
-            # Save mapping
-            with open(mapping_path, 'w') as f:
-                json.dump({
-                    'family_to_idx': family_to_idx,
-                    'idx_to_family': {str(idx): family 
-                                    for family, idx in family_to_idx.items()},
-                }, f, indent=2)
+                'prototypes': trainer.prototypes,
+                'prototype_updates': trainer.prototype_updates,
+                'best_metrics': best_metrics,
+                'epoch': epoch + 1
+            }, os.path.join(save_dir, "prototype_gnn_best.pt"))
     
-    logger.info(f"Model and mapping saved to {save_dir}/")
+    print(f"\n=== Training Complete ===")
+    print(f"Best model achieved at epoch {best_metrics['epoch']}:")
+    print(f"- Combined Accuracy: {best_metrics['combined_acc']:.2%}")
+    print(f"- Existing Families: {best_metrics['existing_acc']:.2%}")
+    print(f"- New Families: {best_metrics['new_acc']:.2%}")
 
-class GNN(torch.nn.Module):
-    def __init__(self, num_node_features, hidden_dim, embedding_dim):
-        super().__init__()
-        self.conv1 = GCNConv(num_node_features, hidden_dim)
-        self.conv2 = GCNConv(hidden_dim, hidden_dim)
-        self.fc = torch.nn.Linear(hidden_dim, embedding_dim)
-        
-    def forward(self, data):
-        x, edge_index = data.x, data.edge_index
-        
-        x = F.relu(self.conv1(x, edge_index))
-        x = F.dropout(x, p=0.5, training=self.training)
-        x = self.conv2(x, edge_index)
-        
-        # Global mean pooling
-        batch = data.batch if hasattr(data, 'batch') else torch.zeros(data.x.size(0), dtype=torch.long)
-        x = global_mean_pool(x, batch)
-        
-        # Project to embedding space
-        x = self.fc(x)
-        return F.normalize(x, p=2, dim=1)  # Normalize embeddings
-    
 if __name__ == '__main__':
     main()
 
-
-# def evaluate(trainer, split_files, family_to_idx, phase, device):
-#     """Evaluate on a split."""
-#     total_correct = 0
-#     total_preds = 0
-#     recall_sum = 0
-#     num_batches = 0
-    
-#     for batch_file in split_files:
-#         loader = load_batch(batch_file, family_to_idx, device=device)
-#         if not loader:
-#             continue
-#         for batch in loader:
-#             correct, total, recall = trainer.evaluate(batch, phase)
-#             total_correct += correct
-#             total_preds += total
-#             recall_sum += recall
-#             num_batches += 1
-    
-#     precision = total_correct / max(1, total_preds)
-#     recall = recall_sum / max(1, num_batches)
-#     return precision, recall
