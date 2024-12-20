@@ -1,470 +1,350 @@
-import json
-import logging
 import torch
-import pandas as pd
-from collections import defaultdict
-from torch_geometric.data import DataLoader
-from torch_geometric.nn import GCNConv, global_mean_pool
 import torch.nn.functional as F
-from typing import List, Dict, Tuple
+from torch_geometric.nn import GCNConv, global_mean_pool
+import json
 import numpy as np
 from datetime import datetime
+import logging
+from pathlib import Path
+from collections import defaultdict
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+import argparse
+from typing import List, Dict, Tuple
 import os
 import glob
+# hierarchical loss
+import sys 
+from torch_geometric.data import DataLoader
+from torch_geometric.data import Data, Batch
 
 
-
-
-def log_temporal_metrics(metrics: dict, evolution: list, epoch: int):
-    """Log temporal performance metrics and family evolution events."""
-    logger.info(f"\nEpoch {epoch} Temporal Metrics:")
-    
-    # Log rolling metrics
-    logger.info("7-day Rolling Averages:")
-    logger.info(f"Known Family Accuracy: {metrics['known_accuracy'].mean():.4f}")
-    logger.info(f"New Family Detection Rate: {metrics['new_detection_rate'].mean():.4f}")
-    logger.info(f"False Positive Rate: {metrics['false_positive_rate'].mean():.4f}")
-    
-    # Log recent evolution events
-    recent_events = [e for e in evolution if (pd.Timestamp.now() - e['timestamp']).days <= 7]
-    if recent_events:
-        logger.info("\nRecent Family Evolution Events:")
-        for event in recent_events:
-            logger.info(f"{event['timestamp']}: {event['family']} - {event['event']}")
-
-def get_predictions(group_logits: torch.Tensor, family_logits: dict) -> List[str]:
-    """Get family predictions from model outputs."""
-    predicted_groups = group_logits.argmax(dim=1)
-    predicted_families = []
-    
-    for i, group_id in enumerate(predicted_groups):
-        group_id = group_id.item()
-        family_logits_group = family_logits[str(group_id)][i]
-        family_idx = family_logits_group.argmax().item()
-        predicted_family = group_mappings['group_to_families'][group_id][family_idx]
-        predicted_families.append(predicted_family)
-    
-    return predicted_families
-
-def get_metrics(batch, new_family_flags: List[bool]) -> Tuple[List[bool], List[bool], List[bool]]:
-    """Compute metrics for both known and new family detection."""
-    correct_known = []  # Correct classifications for known families
-    correct_new = []    # Correct new family detections
-    false_new = []      # False new family detections
-    
-    for true_family, is_new in zip(batch.family, new_family_flags):
-        if is_new:
-            # For samples flagged as new families
-            correct_new.append(true_family not in known_families)
-            false_new.append(true_family in known_families)
-            correct_known.append(False)
-        else:
-            # For samples predicted as known families
-            correct_new.append(False)
-            false_new.append(false_new)
-            correct_known.append(
-                predicted_family == true_family if true_family in known_families else False
-            )
-    
-    return correct_known, correct_new, false_new
-
-def evaluate_temporal(model: torch.nn.Module, 
-                     classifier: TemporalMalwareClassifier,
-                     loader: DataLoader,
-                     device: torch.device) -> dict:
-    """Evaluate model with temporal metrics."""
-    model.eval()
-    metrics = defaultdict(list)
-    
-    with torch.no_grad():
-        for batch_idx, batch in enumerate(loader):
-            batch = batch.to(device)
-            embeddings, group_logits, family_logits = model(batch)
-            
-            # Detect new families
-            new_family_flags = classifier.detect_new_families(embeddings)
-            
-            # Get predictions and compute metrics
-            predictions = get_predictions(group_logits, family_logits)
-            correct_known, correct_new, false_new = get_metrics(batch, new_family_flags)
-            
-            # Store results
-            for i, (pred, true_fam, is_new) in enumerate(zip(predictions, batch.family, new_family_flags)):
-                metrics['timestamp'].append(batch.timestamp[i])
-                metrics['true_family'].append(true_fam)
-                metrics['predicted_family'].append(pred)
-                metrics['is_new'].append(is_new)
-                metrics['correct_known'].append(correct_known[i])
-                metrics['correct_new'].append(correct_new[i])
-                metrics['false_new'].append(false_new[i])
-    
-    # Compute aggregate metrics
-    results = {
-        'known_accuracy': np.mean([m for m, n in zip(metrics['correct_known'], 
-                                                    metrics['is_new']) if not n]),
-        'new_detection_rate': np.mean(metrics['correct_new']),
-        'false_positive_rate': np.mean(metrics['false_new']),
-        'temporal_metrics': {
-            'timestamps': metrics['timestamp'],
-            'accuracies': metrics['correct_known']
-        }
-    }
-    
-    return results
-
-class HierarchicalMalwareClassifier:
-    def __init__(self, behavioral_groups_path: str):
-        self.behavioral_groups = self._load_groups(behavioral_groups_path)
-        self.group_mappings = self._create_mappings()
-        
-    def _load_groups(self, path: str) -> dict:
-        with open(path, 'r') as f:
-            return json.load(f)
-            
-    def _create_mappings(self):
-        """Create bidirectional mappings between families and groups."""
-        family_to_group = {}
-        group_to_families = defaultdict(list)
-        
-        for group_id, families in self.behavioral_groups.items():
-            for family in families:
-                family_to_group[family] = int(group_id)
-                group_to_families[int(group_id)].append(family)
-                
-        return {
-            'family_to_group': family_to_group,
-            'group_to_families': dict(group_to_families)
-        }
-        
-    def get_family_group(self, family: str) -> int:
-        return self.group_mappings['family_to_group'].get(family, -1)
-    
-class HierarchicalGNN(torch.nn.Module):
-    def __init__(self, num_features, num_groups, num_families):
-        super().__init__()
-        
-        # Base GNN layers remain the same
-        self.conv1 = GCNConv(num_features, 128)
-        self.conv2 = GCNConv(128, 256)
-        
-        # Hierarchical classification heads
-        self.group_classifier = torch.nn.Linear(256, num_groups)
-        self.family_classifiers = torch.nn.ModuleDict()
-        
-        # Create separate classifier for each behavioral group
-        for group_id in range(num_groups):
-            num_families_in_group = len(group_mappings['group_to_families'][group_id])
-            self.family_classifiers[str(group_id)] = torch.nn.Linear(256, num_families_in_group)
-            
-    def forward(self, data):
-        # Base GNN encoding
-        x = F.relu(self.conv1(data.x, data.edge_index))
-        x = F.dropout(x, p=0.5, training=self.training)
-        x = self.conv2(x, data.edge_index)
-        
-        # Global pooling
-        x = global_mean_pool(x, data.batch)
-        
-        # Group prediction
-        group_logits = self.group_classifier(x)
-        
-        # Family predictions for each group
-        family_logits = {}
-        for group_id in self.family_classifiers:
-            family_logits[group_id] = self.family_classifiers[group_id](x)
-            
-        return group_logits, family_logits
 
 class HierarchicalLoss(torch.nn.Module):
-    def __init__(self, group_mappings, alpha=0.3):
+    def __init__(self, family_to_group, alpha=0.3):
+        """
+        Initialize hierarchical loss.
+        
+        Args:
+            family_to_group (dict): Mapping from family names to group IDs
+            alpha (float): Weight between group loss and family loss (default: 0.3)
+        """
         super().__init__()
-        self.group_mappings = group_mappings
+        self.family_to_group = family_to_group
         self.alpha = alpha
         
-    def forward(self, group_logits, family_logits, true_families, device):
-        # Convert family labels to group labels
-        true_groups = torch.tensor([
-            self.group_mappings['family_to_group'].get(fam, -1) 
-            for fam in true_families
-        ]).to(device)
+        # Create reverse mapping (group to families)
+        self.group_to_families = defaultdict(list)
+        for family, group in family_to_group.items():
+            self.group_to_families[group].append(family)
+            
+        # Create family to index mappings for each group
+        self.family_to_idx = {}
+        for group_id, families in self.group_to_families.items():
+            self.family_to_idx[group_id] = {
+                fam: idx for idx, fam in enumerate(sorted(families))
+            }
+    
+    def forward(self, embeddings, group_logits, family_logits, true_families, device):
+        """
+        Compute hierarchical loss.
+        
+        Args:
+            embeddings: Graph embeddings from the model
+            group_logits: Predicted group probabilities
+            family_logits: Dictionary of family probabilities per group
+            true_families: List of true family names
+            device: Device to put tensors on
+        """
+        # Convert true_families to list if it's not already
+        if not isinstance(true_families, list):
+            true_families = [true_families]
+            
+        # Convert family labels to group labels with proper error handling
+        true_groups = []
+        for fam in true_families:
+            group = self.family_to_group.get(fam, -1)
+            true_groups.append(group)
+        
+        true_groups = torch.tensor(true_groups, dtype=torch.long).to(device)
         
         # Group classification loss
-        group_loss = F.cross_entropy(group_logits, true_groups)
+        group_loss = F.cross_entropy(
+            group_logits, 
+            true_groups,
+            label_smoothing=0.1,
+            ignore_index=-1  # Ignore any invalid groups
+        )
         
-        # Family classification loss per group
+        # Family classification loss
         family_loss = 0
         valid_samples = 0
         
-        for group_id, group_families in self.group_mappings['group_to_families'].items():
+        for group_id in self.group_to_families:
             # Get samples belonging to this group
             group_mask = (true_groups == group_id)
             if not group_mask.any():
                 continue
                 
             # Get family predictions for this group
-            group_logits = family_logits[str(group_id)][group_mask]
+            group_logits_subset = family_logits[str(group_id)][group_mask]
             
-            # Convert family labels to group-specific indices
-            family_to_idx = {fam: idx for idx, fam in enumerate(group_families)}
-            true_indices = torch.tensor([
-                family_to_idx[fam] for fam in true_families[group_mask]
-            ]).to(device)
+            # Get true family indices for this group
+            true_indices = []
+            for fam in true_families:
+                if self.family_to_group.get(fam) == group_id:
+                    idx = self.family_to_idx[group_id].get(fam, 0)
+                    true_indices.append(idx)
             
-            # Compute loss for this group
-            family_loss += F.cross_entropy(group_logits, true_indices) * group_mask.sum()
-            valid_samples += group_mask.sum()
+            if not true_indices:
+                continue
+                
+            true_indices = torch.tensor(true_indices, dtype=torch.long).to(device)
             
+            # Weight loss by group size
+            group_weight = len(self.group_to_families[group_id]) / len(self.family_to_group)
+            family_loss += group_weight * F.cross_entropy(
+                group_logits_subset,
+                true_indices,
+                label_smoothing=0.1
+            )
+            valid_samples += 1
+        
         if valid_samples > 0:
             family_loss /= valid_samples
-            
-        return self.alpha * group_loss + (1 - self.alpha) * family_loss
+        
+        # Combine losses with alpha weighting
+        total_loss = self.alpha * group_loss + (1 - self.alpha) * family_loss
+        
+        # Add L2 regularization
+        l2_reg = 0.001 * torch.norm(embeddings, p=2, dim=1).mean()
+        total_loss += l2_reg
+        
+        return total_loss
     
-def train_hierarchical(model, train_loader, optimizer, criterion, device):
-    model.train()
-    total_loss = 0
+def save_analysis_results(output_dir: Path, classifier,
+                            drift_analyzer, final_metrics: dict):
+    """Save analysis results to output directory."""
+    # Save family centroids
+    with open(output_dir / 'family_centroids.json', 'w') as f:
+        json.dump(classifier.family_centroids, f)
     
-    for batch in train_loader:
-        batch = batch.to(device)
-        optimizer.zero_grad()
-        
-        group_logits, family_logits = model(batch)
-        loss = criterion(group_logits, family_logits, batch.family, device)
-        
-        loss.backward()
-        optimizer.step()
-        total_loss += loss.item()
-        
-    return total_loss / len(train_loader)
+    # Save drift metrics
+    with open(output_dir / 'drift_metrics.json', 'w') as f:
+        json.dump(drift_analyzer.drift_metrics, f)
+    
+    # Save final metrics
+    with open(output_dir / 'final_metrics.json', 'w') as f:
+        json.dump(final_metrics, f)
+    
 
-def evaluate_hierarchical(model, loader, group_mappings, device):
-    model.eval()
-    group_correct = 0
-    family_correct = 0
-    total = 0
-    
-    with torch.no_grad():
-        for batch in loader:
-            batch = batch.to(device)
-            group_logits, family_logits = model(batch)
-            
-            # Group accuracy
-            pred_groups = group_logits.argmax(dim=1)
-            true_groups = torch.tensor([
-                group_mappings['family_to_group'].get(fam, -1) 
-                for fam in batch.family
-            ]).to(device)
-            group_correct += (pred_groups == true_groups).sum().item()
-            
-            # Family accuracy
-            for i, (pred_group, true_group) in enumerate(zip(pred_groups, true_groups)):
-                if pred_group == true_group:
-                    group_families = group_mappings['group_to_families'][pred_group.item()]
-                    family_logits_group = family_logits[str(pred_group.item())][i]
-                    pred_family_idx = family_logits_group.argmax().item()
-                    pred_family = group_families[pred_family_idx]
-                    if pred_family == batch.family[i]:
-                        family_correct += 1
-                        
-            total += len(batch.family)
-            
-    return {
-        'group_accuracy': group_correct / total,
-        'family_accuracy': family_correct / total
-    }
 
-class TemporalMalwareClassifier(HierarchicalMalwareClassifier):
-    def __init__(self, behavioral_groups_path: str, embedding_dim: int = 256):
-        super().__init__(behavioral_groups_path)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler(f'malware_analysis_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+
+class FamilyDriftAnalyzer:
+    def __init__(self, embedding_dim: int = 256):
         self.embedding_dim = embedding_dim
-        self.family_centroids = {}
-        self.temporal_statistics = defaultdict(list)
-        self.distance_threshold = None  # Will be set during training
-        
-    def update_centroids(self, model, loader, device):
-        """Update family centroids using current model embeddings."""
-        model.eval()
-        family_embeddings = defaultdict(list)
-        
-        with torch.no_grad():
-            for batch in loader:
-                batch = batch.to(device)
-                embeddings = model.get_embeddings(batch)  # New method to get embeddings
-                
-                for emb, family, timestamp in zip(embeddings, batch.family, batch.timestamp):
-                    family_embeddings[family].append({
-                        'embedding': emb.cpu().numpy(),
-                        'timestamp': pd.to_datetime(timestamp)
-                    })
-        
-        # Update centroids with temporal weighting
-        for family, embeds in family_embeddings.items():
-            # Sort by timestamp
-            sorted_embeds = sorted(embeds, key=lambda x: x['timestamp'])
-            
-            # Apply temporal weighting (more recent samples weighted higher)
-            weights = np.exp(np.linspace(-1, 0, len(sorted_embeds)))
-            weighted_embeddings = np.vstack([e['embedding'] for e in sorted_embeds])
-            weighted_centroid = np.average(weighted_embeddings, weights=weights, axis=0)
-            
-            self.family_centroids[family] = {
-                'centroid': weighted_centroid,
-                'last_updated': sorted_embeds[-1]['timestamp'],
-                'num_samples': len(sorted_embeds)
-            }
+        self.family_trajectories = defaultdict(list)
+        self.drift_metrics = defaultdict(dict)
     
-    def compute_distance_threshold(self, model, loader, device, percentile=95):
-        """Compute distance threshold for new family detection."""
-        distances = []
-        
-        with torch.no_grad():
-            for batch in loader:
-                batch = batch.to(device)
-                embeddings = model.get_embeddings(batch)
-                
-                for emb, family in zip(embeddings, batch.family):
-                    if family in self.family_centroids:
-                        centroid = self.family_centroids[family]['centroid']
-                        distance = np.linalg.norm(emb.cpu().numpy() - centroid)
-                        distances.append(distance)
-        
-        self.distance_threshold = np.percentile(distances, percentile)
-        logger.info(f"Set distance threshold to {self.distance_threshold:.4f}")
-        
-    def detect_new_families(self, embeddings: torch.Tensor, confidence_threshold: float = 0.9) -> List[bool]:
-        """Detect potential new families based on distance to existing centroids."""
-        embeddings_np = embeddings.cpu().numpy()
-        new_family_flags = []
-        
-        for embedding in embeddings_np:
-            # Compute distances to all centroids
-            distances = {
-                family: np.linalg.norm(embedding - data['centroid'])
-                for family, data in self.family_centroids.items()
-            }
+    @torch.no_grad()  # Ensure no gradients are tracked for the entire method
+    def track_family_drift(self, family: str, embedding: torch.Tensor, timestamp: pd.Timestamp):
+        """Track a family's position in embedding space over time."""
+        # Safely convert embedding to numpy
+        if torch.is_tensor(embedding):
+            embedding_np = embedding.cpu().numpy()
+        else:
+            embedding_np = embedding
             
-            min_distance = min(distances.values())
-            new_family_flags.append(min_distance > self.distance_threshold)
+        self.family_trajectories[family].append({
+            'embedding': embedding_np,
+            'timestamp': timestamp
+        })
+        
+        # Keep trajectories sorted by timestamp
+        self.family_trajectories[family].sort(key=lambda x: x['timestamp'])
+        
+        # Update drift metrics if we have enough data
+        if len(self.family_trajectories[family]) > 1:
+            self._update_drift_metrics(family)
             
-        return new_family_flags
+    def _update_drift_metrics(self, family: str):
+        """Compute drift metrics for a family."""
+        trajectory = self.family_trajectories[family]
+        
+        # Get time-ordered embeddings
+        embeddings = np.vstack([t['embedding'] for t in trajectory])
+        timestamps = np.array([t['timestamp'] for t in trajectory])
+        
+        # Compute drift metrics
+        self.drift_metrics[family].update({
+            'total_drift': self._compute_total_drift(embeddings),
+            'drift_velocity': self._compute_drift_velocity(embeddings, timestamps),
+            'drift_acceleration': self._compute_drift_acceleration(embeddings, timestamps),
+            'stability_periods': self._identify_stability_periods(embeddings, timestamps),
+            'major_shifts': self._detect_major_shifts(embeddings, timestamps)
+        })
     
-    def analyze_temporal_performance(self, results_dict: Dict):
-        """Analyze classification performance over time."""
-        df = pd.DataFrame(results_dict)
-        df['timestamp'] = pd.to_datetime(df['timestamp'])
-        df.sort_values('timestamp', inplace=True)
+    def _compute_total_drift(self, embeddings: np.ndarray) -> float:
+        """Compute total drift as path length in embedding space."""
+        return np.sum(np.linalg.norm(embeddings[1:] - embeddings[:-1], axis=1))
+    
+    def _compute_drift_velocity(self, embeddings: np.ndarray, 
+                              timestamps: np.ndarray) -> np.ndarray:
+        """Compute drift velocity over time."""
+        time_deltas = np.diff(timestamps).astype('timedelta64[s]').astype(float)
+        displacement = embeddings[1:] - embeddings[:-1]
+        return displacement / time_deltas[:, np.newaxis]
+    
+    def _compute_drift_acceleration(self, embeddings: np.ndarray, 
+                                  timestamps: np.ndarray) -> np.ndarray:
+        """Compute drift acceleration over time."""
+        velocities = self._compute_drift_velocity(embeddings, timestamps)
+        time_deltas = np.diff(timestamps[1:]).astype('timedelta64[s]').astype(float)
+        return np.diff(velocities, axis=0) / time_deltas[:, np.newaxis]
+    
+    def _identify_stability_periods(self, embeddings: np.ndarray, 
+                                  timestamps: np.ndarray, 
+                                  threshold: float = 0.1) -> List[Dict]:
+        """Identify periods where family behavior remains stable."""
+        velocities = self._compute_drift_velocity(embeddings, timestamps)
+        speeds = np.linalg.norm(velocities, axis=1)
         
-        # Compute rolling metrics
-        window_size = '7D'  # 7-day window
-        metrics = {
-            'known_accuracy': df['correct_known'].rolling(window_size).mean(),
-            'new_detection_rate': df['correct_new'].rolling(window_size).mean(),
-            'false_positive_rate': df['false_new'].rolling(window_size).mean()
-        }
+        stable_periods = []
+        current_period = None
         
-        # Analyze family evolution
-        family_first_seen = {}
-        family_evolution = []
+        for i, (speed, ts) in enumerate(zip(speeds, timestamps[1:])):
+            if speed < threshold:
+                if current_period is None:
+                    current_period = {'start': timestamps[i], 'count': 1}
+                current_period['count'] += 1
+                current_period['end'] = ts
+            elif current_period is not None:
+                stable_periods.append(current_period)
+                current_period = None
         
-        for _, row in df.iterrows():
-            if row['predicted_family'] not in family_first_seen:
-                family_first_seen[row['predicted_family']] = row['timestamp']
-                family_evolution.append({
-                    'timestamp': row['timestamp'],
-                    'family': row['predicted_family'],
-                    'event': 'new_family'
+        if current_period is not None:
+            stable_periods.append(current_period)
+            
+        return stable_periods
+    
+    def _detect_major_shifts(self, embeddings: np.ndarray, 
+                           timestamps: np.ndarray, 
+                           threshold: float = 0.5) -> List[Dict]:
+        """Detect major behavioral shifts in family evolution."""
+        velocities = self._compute_drift_velocity(embeddings, timestamps)
+        accelerations = self._compute_drift_acceleration(embeddings, timestamps)
+        
+        major_shifts = []
+        
+        for i, (vel, acc, ts) in enumerate(zip(velocities[1:], accelerations, timestamps[2:])):
+            velocity_magnitude = np.linalg.norm(vel)
+            acceleration_magnitude = np.linalg.norm(acc)
+            
+            if (velocity_magnitude is not None and acceleration_magnitude is not None and velocity_magnitude > threshold and acceleration_magnitude > threshold):
+                shift_analysis = self._analyze_behavioral_shift(
+                    embeddings[i:i+3],
+                    velocities[i:i+2]
+                )
+                
+                major_shifts.append({
+                    'timestamp': ts,
+                    'magnitude': velocity_magnitude,
+                    'acceleration': acceleration_magnitude,
+                    'analysis': shift_analysis
                 })
         
-        return metrics, family_evolution
+        return major_shifts
+    
+    def _analyze_behavioral_shift(self, embeddings: np.ndarray, 
+                                velocities: np.ndarray) -> Dict:
+        """Analyze the nature of a behavioral shift."""
+        direction = velocities[0] / np.linalg.norm(velocities[0])
+        temporary = np.dot(velocities[0], velocities[1]) < 0
+        distance = np.linalg.norm(embeddings[2] - embeddings[0])
+        
+        return {
+            'temporary': temporary,
+            'distance': distance,
+            'direction': direction
+        }
+    
+    def get_family_evolution_summary(self, family: str) -> Dict:
+        """Get comprehensive evolution summary for a family."""
+        if family not in self.drift_metrics:
+            return None
+            
+        metrics = self.drift_metrics[family]
+        trajectory = self.family_trajectories[family]
+        
+        total_time = trajectory[-1]['timestamp'] - trajectory[0]['timestamp']
+        average_velocity = metrics['total_drift'] / total_time.total_seconds()
+        
+        return {
+            'first_seen': trajectory[0]['timestamp'],
+            'last_seen': trajectory[-1]['timestamp'],
+            'total_drift': metrics['total_drift'],
+            'average_velocity': average_velocity,
+            'stability_periods': len(metrics['stability_periods']),
+            'major_shifts': len(metrics['major_shifts']),
+            'evolution_phases': self._identify_evolution_phases(family)
+        }
 
-class TemporalGNN(torch.nn.Module):
-    def __init__(self, num_features, num_groups, num_families, embedding_dim=256):
-        super().__init__()
-        self.embedding_dim = embedding_dim
+    def _identify_evolution_phases(self, family: str) -> List[Dict]:
+        """Identify distinct phases in family evolution."""
+        metrics = self.drift_metrics[family]
+        shifts = metrics['major_shifts']
         
-        # Base GNN layers
-        self.conv1 = GCNConv(num_features, 128)
-        self.conv2 = GCNConv(128, embedding_dim)
+        phases = []
+        last_phase_end = self.family_trajectories[family][0]['timestamp']
         
-        # Classification heads
-        self.group_classifier = torch.nn.Linear(embedding_dim, num_groups)
-        self.family_classifiers = torch.nn.ModuleDict()
+        for shift in shifts:
+            phases.append({
+                'start': last_phase_end,
+                'end': shift['timestamp'],
+                'duration': shift['timestamp'] - last_phase_end,
+                'stability': self._compute_phase_stability(family, last_phase_end, shift['timestamp'])
+            })
+            last_phase_end = shift['timestamp']
         
-        for group_id in range(num_groups):
-            num_families_in_group = len(group_mappings['group_to_families'][group_id])
-            self.family_classifiers[str(group_id)] = torch.nn.Linear(embedding_dim, num_families_in_group)
-    
-    def get_embeddings(self, data):
-        """Get graph embeddings before classification."""
-        x = F.relu(self.conv1(data.x, data.edge_index))
-        x = F.dropout(x, p=0.5, training=self.training)
-        x = self.conv2(x, data.edge_index)
-        return global_mean_pool(x, data.batch)
-    
-    def forward(self, data):
-        embeddings = self.get_embeddings(data)
-        group_logits = self.group_classifier(embeddings)
+        final_timestamp = self.family_trajectories[family][-1]['timestamp']
+        phases.append({
+            'start': last_phase_end,
+            'end': final_timestamp,
+            'duration': final_timestamp - last_phase_end,
+            'stability': self._compute_phase_stability(family, last_phase_end, final_timestamp)
+        })
         
-        family_logits = {}
-        for group_id in self.family_classifiers:
-            family_logits[group_id] = self.family_classifiers[group_id](embeddings)
-        
-        return embeddings, group_logits, family_logits
+        return phases
 
-def train_temporal(model, classifier, train_loader, val_loader, optimizer, criterion, 
-                  device, num_epochs=100):
-    """Training loop with temporal analysis."""
-    results = []
-    
-    for epoch in range(num_epochs):
-        model.train()
-        total_loss = 0
+    def _compute_phase_stability(self, family: str, 
+                               start: pd.Timestamp, 
+                               end: pd.Timestamp) -> float:
+        """Compute stability metric for a specific phase."""
+        trajectory = self.family_trajectories[family]
+        phase_embeddings = [
+            t['embedding'] for t in trajectory 
+            if start <= t['timestamp'] <= end
+        ]
         
-        for batch in train_loader:
-            batch = batch.to(device)
-            optimizer.zero_grad()
+        if len(phase_embeddings) < 2:
+            return 1.0
             
-            embeddings, group_logits, family_logits = model(batch)
-            
-            # Update centroids periodically
-            if epoch % 5 == 0:
-                classifier.update_centroids(model, train_loader, device)
-                classifier.compute_distance_threshold(model, val_loader, device)
-            
-            # Detect new families
-            new_family_flags = classifier.detect_new_families(embeddings)
-            
-            # Compute loss only for known families
-            known_mask = ~torch.tensor(new_family_flags).to(device)
-            if known_mask.any():
-                loss = criterion(
-                    group_logits[known_mask], 
-                    family_logits[known_mask], 
-                    batch.family[known_mask], 
-                    device
-                )
-                loss.backward()
-                optimizer.step()
-                total_loss += loss.item()
-            
-            # Record results
-            results.extend([{
-                'timestamp': ts,
-                'true_family': true_fam,
-                'predicted_family': pred_fam,
-                'is_new': is_new,
-                'correct_known': correct_known,
-                'correct_new': correct_new,
-                'false_new': false_new
-            } for ts, true_fam, pred_fam, is_new, correct_known, correct_new, false_new in 
-                zip(batch.timestamp, batch.family, get_predictions(group_logits, family_logits),
-                    new_family_flags, *get_metrics(batch, new_family_flags))])
-        
-        # Analyze temporal performance
-        if epoch % 10 == 0:
-            metrics, evolution = classifier.analyze_temporal_performance(results)
-            log_temporal_metrics(metrics, evolution, epoch)
-    
-    return results
+        embeddings = np.vstack(phase_embeddings)
+        centroid = np.mean(embeddings, axis=0)
+        distances = np.linalg.norm(embeddings - centroid, axis=1)
+        return 1.0 / (1.0 + np.mean(distances))
+
 
 
 class FamilyDriftAnalyzer:
@@ -515,7 +395,6 @@ class FamilyDriftAnalyzer:
         """Compute drift velocity over time."""
         time_deltas = np.diff(timestamps).astype('timedelta64[s]').astype(float)
         displacement = embeddings[1:] - embeddings[:-1]
-        
         return displacement / time_deltas[:, np.newaxis]
     
     def _compute_drift_acceleration(self, embeddings: np.ndarray, 
@@ -523,7 +402,6 @@ class FamilyDriftAnalyzer:
         """Compute drift acceleration over time."""
         velocities = self._compute_drift_velocity(embeddings, timestamps)
         time_deltas = np.diff(timestamps[1:]).astype('timedelta64[s]').astype(float)
-        
         return np.diff(velocities, axis=0) / time_deltas[:, np.newaxis]
     
     def _identify_stability_periods(self, embeddings: np.ndarray, 
@@ -561,14 +439,12 @@ class FamilyDriftAnalyzer:
         major_shifts = []
         
         for i, (vel, acc, ts) in enumerate(zip(velocities[1:], accelerations, timestamps[2:])):
-            # Detect sudden changes in behavior
             velocity_magnitude = np.linalg.norm(vel)
             acceleration_magnitude = np.linalg.norm(acc)
             
-            if velocity_magnitude > threshold and acceleration_magnitude > threshold:
-                # Analyze the nature of the shift
+            if (velocity_magnitude is not None and acceleration_magnitude is not None and velocity_magnitude > threshold and acceleration_magnitude > threshold):
                 shift_analysis = self._analyze_behavioral_shift(
-                    embeddings[i:i+3],  # Look at before, during, and after shift
+                    embeddings[i:i+3],
                     velocities[i:i+2]
                 )
                 
@@ -584,13 +460,8 @@ class FamilyDriftAnalyzer:
     def _analyze_behavioral_shift(self, embeddings: np.ndarray, 
                                 velocities: np.ndarray) -> Dict:
         """Analyze the nature of a behavioral shift."""
-        # Compute direction of change
         direction = velocities[0] / np.linalg.norm(velocities[0])
-        
-        # Analyze if the change is temporary or permanent
         temporary = np.dot(velocities[0], velocities[1]) < 0
-        
-        # Compute behavioral distance
         distance = np.linalg.norm(embeddings[2] - embeddings[0])
         
         return {
@@ -619,7 +490,7 @@ class FamilyDriftAnalyzer:
             'major_shifts': len(metrics['major_shifts']),
             'evolution_phases': self._identify_evolution_phases(family)
         }
-    
+
     def _identify_evolution_phases(self, family: str) -> List[Dict]:
         """Identify distinct phases in family evolution."""
         metrics = self.drift_metrics[family]
@@ -637,7 +508,6 @@ class FamilyDriftAnalyzer:
             })
             last_phase_end = shift['timestamp']
         
-        # Add final phase
         final_timestamp = self.family_trajectories[family][-1]['timestamp']
         phases.append({
             'start': last_phase_end,
@@ -647,7 +517,7 @@ class FamilyDriftAnalyzer:
         })
         
         return phases
-    
+
     def _compute_phase_stability(self, family: str, 
                                start: pd.Timestamp, 
                                end: pd.Timestamp) -> float:
@@ -663,208 +533,934 @@ class FamilyDriftAnalyzer:
             
         embeddings = np.vstack(phase_embeddings)
         centroid = np.mean(embeddings, axis=0)
-        
-        # Compute average distance from centroid
         distances = np.linalg.norm(embeddings - centroid, axis=1)
         return 1.0 / (1.0 + np.mean(distances))
+
+
+class TemporalMalwareClassifier:
+    def __init__(self, behavioral_groups_path: str, embedding_dim: int = 256):
+        self.group_mappings = self._load_groups(behavioral_groups_path)
+        self.embedding_dim = embedding_dim
+        self.family_centroids = {}
+        self.temporal_statistics = defaultdict(list)
+        self.distance_threshold = None
+
+
+class TemporalMalwareClassifier:
+    def __init__(self, behavioral_groups_path: str, embedding_dim: int = 256):
+        try:
+            self.group_mappings = self._load_groups(behavioral_groups_path)
+        except Exception as e:
+            logger.error(f"Error loading behavioral groups from {behavioral_groups_path}: {str(e)}")
+            raise
+        self.embedding_dim = embedding_dim
+        self.family_centroids = {}
+        self.temporal_statistics = defaultdict(list)
+        self.distance_threshold = None
     
-def train_with_drift_analysis(model, classifier, train_loader, optimizer, drift_analyzer):
-    for batch in train_loader:
-        # Your existing training code here
-        embeddings, group_logits, family_logits = model(batch)
+    def _load_groups(self, path: str) -> dict:
+        """Load behavioral groups from JSON file.
         
-        # Track drift for each sample
-        for emb, family, timestamp in zip(embeddings, batch.family, batch.timestamp):
-            drift_analyzer.track_family_drift(
-                family, 
-                emb.detach().cpu().numpy(),
-                pd.to_datetime(timestamp)
+        Args:
+            path (str): Path to JSON file containing group mappings in format:
+                       {"group_id": ["family1", "family2", ...], ...}
+            
+        Returns:
+            dict: Dictionary containing:
+                - family_to_group: Maps family names to group IDs
+                - group_to_families: Maps group IDs to lists of family names
+        """
+        try:
+            with open(path, 'r') as f:
+                group_data = json.load(f)
+                
+            family_to_group = {}
+            group_to_families = {}
+            
+            for group_id, families in group_data.items():
+                group_id = int(group_id)  # Convert string group ID to int
+                group_to_families[group_id] = families
+                for family in families:
+                    family_to_group[family] = group_id
+                    
+            logger.info(f"Loaded {len(family_to_group)} families in {len(group_to_families)} groups")
+            
+            return {
+                'family_to_group': family_to_group,
+                'group_to_families': group_to_families
+            }
+            
+        except Exception as e:
+            logger.error(f"Error loading groups from {path}: {str(e)}")
+            raise
+    def detect_new_families(self, embeddings: torch.Tensor) -> List[bool]:
+        """Detect potential new families based on distance to existing centroids."""
+        with torch.no_grad():  # Ensure no gradients are tracked
+            # Move to CPU and convert to numpy
+            embeddings_np = embeddings.detach().cpu().numpy()
+            new_family_flags = []
+            
+            for embedding in embeddings_np:
+                distances = {
+                    family: np.linalg.norm(embedding - data['centroid'])
+                    for family, data in self.family_centroids.items()
+                }
+                
+                min_distance = min(distances.values()) if distances else float('inf')
+                new_family_flags.append(min_distance is not None and self.distance_threshold is not None and min_distance > self.distance_threshold)
+                
+            return new_family_flags
+    
+    def update_centroids(self, model, loader, device):
+        """Update family centroids using current model embeddings."""
+        model.eval()  # Set model to evaluation mode
+        family_embeddings = defaultdict(list)
+        
+        with torch.no_grad():  # Ensure no gradients are tracked
+            for batch in loader:
+                batch = batch.to(device)
+                embeddings = model.get_embeddings(batch)
+                
+                # Safely convert embeddings to numpy
+                embeddings_np = embeddings.cpu().numpy()
+                
+                for emb, family, timestamp in zip(embeddings_np, batch.family, batch.timestamp):
+                    family_embeddings[family].append({
+                        'embedding': emb,
+                        'timestamp': pd.to_datetime(timestamp)
+                    })
+        
+        # Process the collected embeddings
+        for family, embeds in family_embeddings.items():
+            sorted_embeds = sorted(embeds, key=lambda x: x['timestamp'])
+            weights = np.exp(np.linspace(-1, 0, len(sorted_embeds)))
+            weighted_embeddings = np.vstack([e['embedding'] for e in sorted_embeds])
+            weighted_centroid = np.average(weighted_embeddings, weights=weights, axis=0)
+            
+            self.family_centroids[family] = {
+                'centroid': weighted_centroid,
+                'last_updated': sorted_embeds[-1]['timestamp'],
+                'num_samples': len(sorted_embeds)
+            }
+    
+    def compute_distance_threshold(self, model, loader, device, percentile=95):
+        """Compute distance threshold for new family detection."""
+        distances = []
+        model.eval()  # Set model to evaluation mode
+        
+        with torch.no_grad():  # Ensure no gradients are tracked
+            for batch in loader:
+                batch = batch.to(device)
+                embeddings = model.get_embeddings(batch)
+                
+                # Safely convert embeddings to numpy
+                embeddings_np = embeddings.cpu().numpy()
+                
+                for emb, family in zip(embeddings_np, batch.family):
+                    if family in self.family_centroids:
+                        centroid = self.family_centroids[family]['centroid']
+                        distance = np.linalg.norm(emb - centroid)
+                        distances.append(distance)
+        
+        if distances:
+            self.distance_threshold = np.percentile(distances, percentile)
+            logger.info(f"Set distance threshold to {self.distance_threshold:.4f}")
+        else:
+            logger.warning("No distances computed for threshold calculation")
+
+            
+    def update_centroids(self, model, loader, device):
+        """Update family centroids using current model embeddings."""
+        model.eval()  # Set model to evaluation mode
+        family_embeddings = defaultdict(list)
+        
+        with torch.no_grad():  # Ensure no gradients are tracked
+            for batch in loader:
+                batch = batch.to(device)
+                embeddings = model.get_embeddings(batch)
+                
+                # Safely convert embeddings to numpy
+                embeddings_np = embeddings.cpu().numpy()
+                
+                for emb, family, timestamp in zip(embeddings_np, batch.family, batch.timestamp):
+                    family_embeddings[family].append({
+                        'embedding': emb,
+                        'timestamp': pd.to_datetime(timestamp)
+                    })
+        
+        # Process the collected embeddings
+        for family, embeds in family_embeddings.items():
+            sorted_embeds = sorted(embeds, key=lambda x: x['timestamp'])
+            weights = np.exp(np.linspace(-1, 0, len(sorted_embeds)))
+            weighted_embeddings = np.vstack([e['embedding'] for e in sorted_embeds])
+            weighted_centroid = np.average(weighted_embeddings, weights=weights, axis=0)
+            
+            self.family_centroids[family] = {
+                'centroid': weighted_centroid,
+                'last_updated': sorted_embeds[-1]['timestamp'],
+                'num_samples': len(sorted_embeds)
+            }
+    
+    def compute_distance_threshold(self, model, loader, device, percentile=95):
+        """Compute distance threshold for new family detection."""
+        distances = []
+        model.eval()  # Set model to evaluation mode
+        
+        with torch.no_grad():  # Ensure no gradients are tracked
+            for batch in loader:
+                batch = batch.to(device)
+                embeddings = model.get_embeddings(batch)
+                
+                # Safely convert embeddings to numpy
+                embeddings_np = embeddings.cpu().numpy()
+                
+                for emb, family in zip(embeddings_np, batch.family):
+                    if family in self.family_centroids:
+                        centroid = self.family_centroids[family]['centroid']
+                        distance = np.linalg.norm(emb - centroid)
+                        distances.append(distance)
+        
+        if distances:
+            self.distance_threshold = np.percentile(distances, percentile)
+            logger.info(f"Set distance threshold to {self.distance_threshold:.4f}")
+        else:
+            logger.warning("No distances computed for threshold calculation")
+
+
+
+def evaluate_predictions(group_logits, family_logits, true_families, 
+                       new_family_flags, group_mappings):
+    """Evaluate predictions for a batch."""
+    pred_groups = group_logits.argmax(dim=1)
+    metrics = defaultdict(list)
+    
+    for i, (pred_group, true_family, is_new) in enumerate(
+            zip(pred_groups, true_families, new_family_flags)):
+        
+        true_group = group_mappings['family_to_group'][true_family]
+        
+        # Group accuracy
+        group_correct = (pred_group.item() == true_group)
+        metrics['group_accuracy'].append(group_correct)
+        
+        # Family prediction accuracy
+        if not is_new:
+            family_logits_group = family_logits[str(pred_group.item())][i]
+            pred_family_idx = family_logits_group.argmax().item()
+            pred_family = group_mappings['group_to_families'][pred_group.item()][pred_family_idx]
+            metrics['accuracy'].append(pred_family == true_family)
+        
+        # New family detection
+        metrics['new_family_detection'].append(
+            is_new == (true_family not in group_mappings['family_to_group'])
+        )
+    
+    return {k: np.mean(v) for k, v in metrics.items()}
+
+class HierarchicalMalwareGNN(torch.nn.Module):
+    def __init__(self, num_features, num_groups=16, embedding_dim=256):
+        super().__init__()
+        self.embedding_dim = embedding_dim
+        
+        # Base Graph Neural Network layers
+        self.conv1 = GCNConv(num_features, 128)
+        self.conv2 = GCNConv(128, embedding_dim)
+        
+        # Group classification head
+        self.group_classifier = torch.nn.Linear(embedding_dim, num_groups)
+        
+        # Separate classifiers for each behavioral group
+        self.family_classifiers = torch.nn.ModuleDict()
+    
+    def add_family_classifier(self, group_id: str, num_families: int):
+        """Dynamically add a family classifier for a behavioral group"""
+        self.family_classifiers[str(group_id)] = torch.nn.Linear(
+            self.embedding_dim, num_families
+        )
+    
+    def get_embeddings(self, data):
+        """Extract graph embeddings"""
+        # Get device from model parameters
+        device = next(self.parameters()).device
+        
+        # Move graph data to correct device
+        x = data.x.to(device)
+        edge_index = data.edge_index.to(device)
+        batch = data.batch.to(device)
+        
+        # Forward pass through GNN layers
+        x = F.relu(self.conv1(x, edge_index))
+        x = F.dropout(x, p=0.5, training=self.training)
+        x = self.conv2(x, edge_index)
+        
+        # Global pooling
+        embeddings = global_mean_pool(x, batch)
+        return embeddings
+    
+    def forward(self, data):
+        device = next(self.parameters()).device
+        
+        # Get embeddings
+        embeddings = self.get_embeddings(data)
+        
+        # Group classification
+        group_logits = self.group_classifier(embeddings)
+        
+        # Family classification for each group
+        family_logits = {}
+        for group_id in self.family_classifiers:
+            family_logits[group_id] = self.family_classifiers[group_id](embeddings)
+            
+        return embeddings, group_logits, family_logits
+
+
+def evaluate(model, split_files, family_to_group, device, criterion, batch_size=32):
+    """Evaluate the model."""
+    model.eval()
+    total_loss = 0
+    num_batches = 0
+    correct = 0
+    total = 0
+    
+    with torch.no_grad():
+        for batch_file in split_files:
+            # Load batch data
+            batch_loader = load_batch(batch_file, family_to_group, batch_size=batch_size)
+            if not batch_loader:
+                continue
+            
+            for batch in batch_loader:
+                try:
+                    # Move batch to device
+                    batch = batch.to(device)
+                    
+                    # Forward pass
+                    embeddings, group_logits, family_logits = model(batch)
+                    
+                    # Get predictions
+                    pred_groups = group_logits.argmax(dim=1)
+                    true_groups = torch.tensor([
+                        family_to_group.get(fam, -1) for fam in batch.family
+                    ]).to(device)
+                    
+                    # Compute metrics
+                    correct += (pred_groups == true_groups).sum().item()
+                    total += len(true_groups)
+                    
+                    # Compute loss
+                    loss = criterion(embeddings, group_logits, family_logits, batch.family, device)
+                    total_loss += loss.item()
+                    num_batches += 1
+                    
+                except RuntimeError as e:
+                    logger.error(f"Error processing batch: {str(e)}")
+                    continue
+    
+    accuracy = correct / max(1, total)
+    avg_loss = total_loss / max(1, num_batches)
+    return avg_loss, accuracy
+
+
+
+def evaluate(model, split_files, family_to_group, device, criterion, batch_size=32):
+    """Evaluate the model."""
+    model.eval()
+    total_loss = 0
+    num_batches = 0
+    correct = 0
+    total = 0
+    
+    with torch.no_grad():
+        for batch_file in split_files:
+            # Load batch data
+            batch_loader = load_batch(batch_file, family_to_group, batch_size=batch_size)
+            if not batch_loader:
+                continue
+            
+            for batch in batch_loader:
+                try:
+                    # Move batch to device
+                    batch = batch.to(device)
+                    
+                    # Forward pass
+                    embeddings, group_logits, family_logits = model(batch)
+                    
+                    # Get predictions
+                    pred_groups = group_logits.argmax(dim=1)
+                    true_groups = torch.tensor([
+                        family_to_group.get(fam, -1) for fam in batch.family
+                    ]).to(device)
+                    
+                    # Compute metrics
+                    correct += (pred_groups == true_groups).sum().item()
+                    total += len(true_groups)
+                    
+                    # Compute loss
+                    loss = criterion(embeddings, group_logits, family_logits, batch.family, device)
+                    total_loss += loss.item()
+                    num_batches += 1
+                    
+                except RuntimeError as e:
+                    logger.error(f"Error processing batch: {str(e)}")
+                    continue
+    
+    accuracy = correct / max(1, total)
+    avg_loss = total_loss / max(1, num_batches)
+    return avg_loss, accuracy
+
+                   
+def load_batch(batch_file, family_to_group, batch_size=32):
+    """Load and preprocess a single batch file with robust error handling.
+    
+    Args:
+        batch_file (str): Path to the batch file
+        family_to_group (dict): Mapping from family names to group IDs
+        batch_size (int): Size of batches to create
+        
+    Returns:
+        DataLoader or None: DataLoader containing processed graphs, or None if processing fails
+    """
+    try:
+        if not os.path.exists(batch_file):
+            logger.warning(f"Batch file not found: {batch_file}")
+            return None
+            
+        # Load batch from file
+        batch_data = torch.load(batch_file)
+        print("Batch families:", [getattr(g, 'family', 'none') for g in batch_data])
+        if not batch_data:
+            logger.warning(f"Empty batch file: {batch_file}")
+            return None
+            
+        processed = []
+        
+        for graph in batch_data:
+            try:
+                # Verify it's a PyG Data object
+                if not isinstance(graph, Data):
+                    logger.error(f"Graph is not a PyG Data object: {type(graph)}")
+                    continue
+                
+                # Process family label
+                family = getattr(graph, 'family', 'none')
+                if not family or family == '':
+                    family = 'none'
+                
+                # Get group ID safely with debug logging
+                group = family_to_group.get(family, -1)
+                logger.debug(f"Family: {family}, Group: {group}")
+                
+                # Convert group to tensor explicitly and ensure it's properly shaped
+                graph.group = torch.tensor(group, dtype=torch.long)
+                graph.y = torch.tensor(group, dtype=torch.long)  # Add y for compatibility
+                graph.family = family  # Keep original family name
+                
+                # Debug log tensor shapes
+                logger.debug(f"Graph tensor shapes - x: {graph.x.shape}, edge_index: {graph.edge_index.shape}")
+                
+                # Handle edge attributes safely
+                if graph.edge_index.size(1) == 0:
+                    graph.edge_attr = torch.zeros((0, 1))
+                else:
+                    graph.edge_attr = torch.ones((graph.edge_index.size(1), 1))
+                
+                # Verify tensor dimensions
+                if graph.x.dim() != 2:
+                    logger.error(f"Unexpected x dimensions: {graph.x.shape}")
+                    continue
+                    
+                if graph.edge_index.dim() != 2 or graph.edge_index.size(0) != 2:
+                    logger.error(f"Unexpected edge_index dimensions: {graph.edge_index.shape}")
+                    continue
+                
+                # Verify edge indices are within bounds
+                if graph.edge_index.size(1) > 0:
+                    max_idx = graph.edge_index.max().item()
+                    if max_idx >= graph.x.size(0):
+                        logger.error(f"Edge indices out of bounds. Max index: {max_idx}, num nodes: {graph.x.size(0)}")
+                        continue
+                
+                processed.append(graph)
+                
+            except Exception as e:
+                logger.error(f"Error processing graph: {str(e)}")
+                continue
+                
+        if not processed:
+            logger.warning(f"No valid graphs found in {batch_file}")
+            return None
+            
+        # Create DataLoader with additional checks
+        try:
+            loader = DataLoader(
+                processed, 
+                batch_size=min(batch_size, len(processed)),
+                shuffle=False
             )
+            
+            # Verify first batch to ensure proper formatting
+            sample_batch = next(iter(loader))
+            required_batch_attrs = ['x', 'edge_index', 'batch']
+            missing_batch_attrs = [
+                attr for attr in required_batch_attrs 
+                if not hasattr(sample_batch, attr)
+            ]
+            
+            if missing_batch_attrs:
+                logger.error(f"Batch missing required attributes: {missing_batch_attrs}")
+                return None
+                
+            # Reset loader iterator
+            loader = DataLoader(
+                processed, 
+                batch_size=min(batch_size, len(processed)),
+                shuffle=False
+            )
+            
+            return loader
+            
+        except Exception as e:
+            logger.error(f"Error creating DataLoader: {str(e)}")
+            return None
         
-        # Periodically analyze drift patterns
-        if batch_idx % 100 == 0:
-            for family in drift_analyzer.family_trajectories:
-                summary = drift_analyzer.get_family_evolution_summary(family)
-                if summary['major_shifts']:
-                    logger.info(f"Family {family} evolution summary:")
-                    logger.info(f"Total drift: {summary['total_drift']:.4f}")
-                    logger.info(f"Major behavioral shifts: {len(summary['major_shifts'])}")
-                    for phase in summary['evolution_phases']:
-                        logger.info(f"Phase: {phase['start']} to {phase['end']}")
-                        logger.info(f"Stability: {phase['stability']:.4f}")
+    except Exception as e:
+        logger.error(f"Error loading batch {batch_file}: {str(e)}")
+        return None
 
-import argparse
-import logging
-import torch
-from pathlib import Path
-import matplotlib.pyplot as plt
-import seaborn as sns
-from datetime import datetime
+def validate_model(model, val_loader, criterion, classifier, device):
+    """Validate model on validation set."""
+    model.eval()
+    total_loss = 0
+    num_batches = 0
+    metrics = defaultdict(list)
+    
+    with torch.no_grad():
+        if isinstance(val_loader, str):
+            val_files = [val_loader]
+        elif isinstance(val_loader, (list, tuple)):
+            val_files = val_loader
+        else:
+            val_files = val_loader
+            
+        for batch_file in val_files:
+            # Load batch data
+            batch_loader = load_batch(
+                batch_file,
+                classifier.group_mappings['family_to_group']
+            )
+            if not batch_loader:
+                continue
+                
+            for batch in batch_loader:
+                try:
+                    # Move batch to device
+                    batch = batch.to(device)
+                    
+                    # Forward pass
+                    embeddings, group_logits, family_logits = model(batch)
+                    
+                    # Detect new families
+                    new_family_flags = classifier.detect_new_families(embeddings)
+                    
+                    # Compute loss
+                    loss = criterion(embeddings, group_logits, family_logits,
+                                   batch.family, device)
+                    total_loss += loss.item()
+                    num_batches += 1
+                    
+                    # Compute batch metrics
+                    batch_metrics = evaluate_predictions(
+                        group_logits, family_logits,
+                        batch.family, new_family_flags,
+                        classifier.group_mappings
+                    )
+                    
+                    for k, v in batch_metrics.items():
+                        metrics[k].append(v)
+                        
+                except RuntimeError as e:
+                    logger.error(f"Error processing validation batch: {str(e)}")
+                    continue
+    
+    # Compute average metrics
+    avg_metrics = {
+        'val_loss': total_loss / max(1, num_batches)
+    }
+    avg_metrics.update({
+        k: np.mean(v) for k, v in metrics.items()
+    })
+    
+    return avg_metrics
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler(f'malware_analysis_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log'),
-        logging.StreamHandler()
-    ]
-)
-logger = logging.getLogger(__name__)
+def train_temporal(model, classifier, train_loader, val_loader, optimizer, criterion, 
+                  device, drift_analyzer, num_epochs=10):
+    """Training loop with temporal analysis."""
+    best_val_loss = float('inf')
+    results = []
+    
+    # Ensure model is on correct device
+    model = model.to(device)
+    
+    # Convert loaders to lists if they aren't already
+    train_files = train_loader if isinstance(train_loader, (list, tuple)) else [train_loader]
+    val_files = val_loader if isinstance(val_loader, (list, tuple)) else [val_loader]
+    
+    for epoch in range(num_epochs):
+        model.train()
+        total_loss = 0
+        num_batches = 0
+        
+        # Training
+        for batch_file in train_files:
+            # Load batch data with new robust loader
+            batch_loader = load_batch(
+                batch_file, 
+                classifier.group_mappings['family_to_group']
+            )
+            
+            if not batch_loader:
+                logger.warning(f"Skipping invalid batch file: {batch_file}")
+                continue
+            
+            for batch_data in batch_loader:
+                try:
+                    # Move batch to device
+                    batch_data = batch_data.to(device)
+                    
+                    optimizer.zero_grad()
+                    
+                    # Forward pass
+                    embeddings, group_logits, family_logits = model(batch_data)
+                    
+                    # Ensure family data is properly formatted for loss computation
+                    batch_families = batch_data.family if isinstance(batch_data.family, list) else [batch_data.family]
+                    
+                    # Debug information
+                    logger.debug(f"Batch shapes - embeddings: {embeddings.shape}, group_logits: {group_logits.shape}")
+                    logger.debug(f"Number of families in batch: {len(batch_families)}")
+                    
+                    # Compute loss with proper tensor handling
+                    loss = criterion(
+                        embeddings, 
+                        group_logits, 
+                        family_logits, 
+                        batch_families,
+                        device
+                    )
+                    
+                    # Backward pass
+                    loss.backward()
+                    optimizer.step()
+                    
+                    # Track metrics
+                    total_loss += loss.item()
+                    num_batches += 1
+                    
+                except RuntimeError as e:
+                    logger.error(f"Error processing batch: {str(e)}")
+                    continue
+        
+        if num_batches == 0:
+            logger.error("No valid batches processed in epoch")
+            continue
+            
+        avg_train_loss = total_loss / num_batches
+        
+        # Validation
+        val_metrics = validate_model(
+            model, val_files, criterion, classifier, device
+        )
+        
+        # Log progress
+        logger.info(f"Epoch {epoch}:")
+        logger.info(f"Train Loss: {avg_train_loss:.4f}")
+        logger.info(f"Val Loss: {val_metrics['val_loss']:.4f}")
+        
+        # Save best model
+        if val_metrics.get('val_loss') is not None and (best_val_loss is None or val_metrics['val_loss'] < best_val_loss):
+            best_val_loss = val_metrics['val_loss']
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'val_loss': best_val_loss,
+            }, 'best_model.pt')
+        
+        results.append({
+            'epoch': epoch,
+            'train_loss': avg_train_loss,
+            'val_metrics': val_metrics
+        })
+    
+    return results
+
+def validate_model(model, val_loader, criterion, classifier, device):
+    """Validate model on validation set."""
+    model.eval()
+    total_loss = 0
+    num_batches = 0
+    metrics = defaultdict(list)
+    
+    with torch.no_grad():
+        for batch_file in val_loader:
+            batch_loader = load_batch(
+                batch_file,
+                classifier.group_mappings['family_to_group'],
+                #device=device
+            )
+            if not batch_loader:
+                continue
+                
+            for batch in batch_loader:
+                batch = batch.to(device)
+                
+                # Forward pass
+                embeddings, group_logits, family_logits = model(batch)
+                
+                # Detect new families
+                new_family_flags = classifier.detect_new_families(embeddings)
+                
+                # Compute loss
+                loss = criterion(embeddings, group_logits, family_logits,
+                               batch.family, device)
+                total_loss += loss.item()
+                num_batches += 1
+                
+                # Compute batch metrics
+                batch_metrics = evaluate_predictions(
+                    group_logits, family_logits,
+                    batch.family, new_family_flags,
+                    classifier.group_mappings
+                )
+                
+                for k, v in batch_metrics.items():
+                    metrics[k].append(v)
+    
+    # Compute average metrics
+    avg_metrics = {
+        'val_loss': total_loss / max(1, num_batches)
+    }
+    avg_metrics.update({
+        k: np.mean(v) for k, v in metrics.items()
+    })
+    
+    return avg_metrics
+
+def prepare_data(base_dir='bodmas_batches'):
+    """Prepare datasets with temporal ordering."""
+    split_files = defaultdict(list)
+    file_timestamps = {}
+    
+    logger.info("Starting data preparation...")
+    
+    # Process each split
+    for split in ['train', 'val', 'test']:
+        split_dir = os.path.join(base_dir, split)
+        if not os.path.exists(split_dir):
+            logger.warning(f"Split directory not found: {split_dir}")
+            continue
+            
+        # Collect all batch files
+        batch_files = glob.glob(os.path.join(split_dir, 'batch_*.pt'))
+        
+        # Add each file to the appropriate split
+        for file_path in batch_files:
+            try:
+                # Just get the first sample's timestamp without loading entire batch
+                batch = torch.load(file_path)
+                if batch and len(batch) > 0:
+                    file_timestamps[file_path] = getattr(batch[0], 'timestamp', None)
+                    split_files[split].append(file_path)
+                
+            except Exception as e:
+                logger.error(f"Error loading {file_path}: {str(e)}")
+                continue
+    
+    # Sort files by timestamp within each split
+    for split in split_files:
+        split_files[split].sort(key=lambda x: file_timestamps.get(x, pd.Timestamp.min))
+    
+    return dict(split_files), file_timestamps
+
+def evaluate(model, split_files, family_to_group, device, criterion, batch_size=32):
+    """Evaluate the model."""
+    model.eval()
+    total_loss = 0
+    num_batches = 0
+    correct = 0
+    total = 0
+    
+    with torch.no_grad():
+        for batch_file in split_files:
+            batch_loader = load_batch(batch_file, family_to_group, batch_size=batch_size)
+            if not batch_loader:
+                continue
+                
+            for batch in batch_loader:
+                # Forward pass
+                embeddings, group_logits, family_logits = model(batch)
+                
+                # Get predictions
+                pred_groups = group_logits.argmax(dim=1)
+                true_groups = torch.tensor([
+                    family_to_group.get(fam, -1) for fam in batch.family
+                ]).to(device)
+                
+                # Compute metrics
+                correct += (pred_groups == true_groups).sum().item()
+                total += len(true_groups)
+                
+                # Compute loss
+                loss = criterion(embeddings, group_logits, family_logits, batch.family, device)
+                total_loss += loss.item()
+                num_batches += 1
+    
+    accuracy = correct / max(1, total)
+    avg_loss = total_loss / max(1, num_batches)
+    return avg_loss, accuracy
 
 def main():
+    # Parse arguments
     parser = argparse.ArgumentParser(description='Malware Family Evolution Analysis')
     parser.add_argument('--batch_dir', type=str, default='bodmas_batches',
                        help='Directory containing processed batches')
-    parser.add_argument('--output_dir', type=str, default='evolution_analysis',
-                       help='Directory for saving results')
-    parser.add_argument('--behavioral_groups', type=str, default='behavioral_analysis/behavioral_groups.json',
+    parser.add_argument('--behavioral_groups', type=str, required=True,
                        help='Path to behavioral groups JSON')
+    parser.add_argument('--num_epochs', type=int, default=100,
+                       help='Number of training epochs')
+    parser.add_argument('--batch_size', type=int, default=32,
+                       help='Batch size for training')
     parser.add_argument('--embedding_dim', type=int, default=256,
                        help='Dimension of graph embeddings')
+    parser.add_argument('--output_dir', type=str, default='evolution_analysis',
+                       help='Directory for saving results')
+    parser.add_argument('--device', type=str, choices=['cuda', 'cpu'], 
+                       default='cuda' if torch.cuda.is_available() else 'cpu',
+                       help='Device to use for training')
     args = parser.parse_args()
 
-    # Create output directory
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        # Set up output directory
+        output_dir = Path(args.output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
 
-    logger.info("Initializing components...")
-    
-    # Initialize classifier and drift analyzer
-    classifier = TemporalMalwareClassifier(
-        behavioral_groups_path=args.behavioral_groups,
-        embedding_dim=args.embedding_dim
-    )
-    
-    drift_analyzer = FamilyDriftAnalyzer(embedding_dim=args.embedding_dim)
+        # Set up device
+        device = torch.device(args.device)
+        logger.info(f"Using device: {device}")
 
-    # Load data
-    logger.info("Loading data...")
-    train_loader = load_temporal_data(f"{args.batch_dir}/train")
-    val_loader = load_temporal_data(f"{args.batch_dir}/val")
-    test_loader = load_temporal_data(f"{args.batch_dir}/test")
+        # Initialize temporal components
+        logger.info("Initializing temporal components...")
+        classifier = TemporalMalwareClassifier(
+            behavioral_groups_path=args.behavioral_groups,
+            embedding_dim=args.embedding_dim
+        )
+        drift_analyzer = FamilyDriftAnalyzer(embedding_dim=args.embedding_dim)
 
-    # Initialize model
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    logger.info(f"Using device: {device}")
-    
-    num_features = next(iter(train_loader)).x.size(1)  # Get feature dimension from data
-    model = TemporalGNN(
-        num_features=num_features,
-        num_groups=len(classifier.group_mappings['group_to_families']),
-        num_families=len(classifier.family_centroids),
-        embedding_dim=args.embedding_dim
-    ).to(device)
+        # Prepare data
+        logger.info("Preparing data...")
+        split_files, file_timestamps = prepare_data(args.batch_dir)
+        
+        if not any(split_files.values()):
+            logger.error("No data found!")
+            return
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
-    criterion = HierarchicalLoss(classifier.group_mappings)
+        # Get feature dimension from first batch
+        try:
+            first_batch = torch.load(split_files['train'][0])
+            num_features = first_batch[0].x.size(1)
+            logger.info(f"Number of features: {num_features}")
+        except Exception as e:
+            logger.error(f"Error loading first batch: {str(e)}")
+            return
 
-    # Training loop with drift analysis
-    logger.info("Starting training with drift analysis...")
-    best_val_acc = 0
-    best_model_path = output_dir / 'best_model.pt'
+        # Initialize model
+        logger.info("Initializing model...")
+        model = HierarchicalMalwareGNN(
+            num_features=num_features,
+            num_groups=len(set(classifier.group_mappings['family_to_group'].values())),
+            embedding_dim=args.embedding_dim
+        )
 
-    for epoch in range(100):  # 100 epochs
-        # Train
-        train_results = train_temporal(
+        # Add family classifiers for each group
+        for group_id, families in classifier.group_mappings['group_to_families'].items():
+            model.add_family_classifier(str(group_id), len(families))
+
+        # Move model to device
+        model = model.to(device)
+        logger.info(f"Model moved to {device}")
+
+        # Initialize optimizer and criterion
+        optimizer = torch.optim.AdamW(model.parameters(), lr=0.001)
+        criterion = HierarchicalLoss(classifier.group_mappings['family_to_group'])
+
+        # Training with temporal analysis
+        logger.info("Starting training with temporal analysis...")
+        # Get file lists for each split
+        train_files = split_files['train']
+        val_files = split_files['val']
+        test_files = split_files['test']
+
+        logger.info(f"Number of training files: {len(train_files)}")
+        logger.info(f"Number of validation files: {len(val_files)}")
+        logger.info(f"Number of test files: {len(test_files)}")
+
+        results = train_temporal(
             model=model,
             classifier=classifier,
-            train_loader=train_loader,
-            val_loader=val_loader,
+            train_loader=train_files,
+            val_loader=val_files,
             optimizer=optimizer,
             criterion=criterion,
             device=device,
-            drift_analyzer=drift_analyzer
+            drift_analyzer=drift_analyzer,
+            num_epochs=args.num_epochs
         )
 
-        # Validate
-        val_metrics = evaluate_temporal(model, classifier, val_loader, device)
+        # Load best model for final evaluation
+        logger.info("Loading best model for final evaluation...")
+        try:
+            checkpoint = torch.load('best_temporal_model.pt', map_location=device)
+            model.load_state_dict(checkpoint['model_state_dict'])
+        except Exception as e:
+            logger.error(f"Error loading best model: {str(e)}")
+            return
         
-        # Log metrics
-        logger.info(f"Epoch {epoch}:")
-        logger.info(f"Known Family Accuracy: {val_metrics['known_accuracy']:.4f}")
-        logger.info(f"New Family Detection Rate: {val_metrics['new_detection_rate']:.4f}")
-        logger.info(f"False Positive Rate: {val_metrics['false_positive_rate']:.4f}")
+        # Final test evaluation
+        logger.info("Running final evaluation...")
+        test_loss, test_acc = evaluate(
+            model=model,
+            split_files=split_files['test'],
+            family_to_group=classifier.group_mappings['family_to_group'],
+            device=device,
+            criterion=criterion,
+            batch_size=args.batch_size
+        )
+        
+        # Save final results
+        logger.info("Saving analysis results...")
+        final_metrics = {
+            'test_loss': test_loss,
+            'test_accuracy': test_acc,
+            'training_history': results
+        }
+        
+        try:
+            save_analysis_results(output_dir, classifier, drift_analyzer, final_metrics)
+        except Exception as e:
+            logger.error(f"Error saving results: {str(e)}")
+        
+        # Log final results
+        logger.info("\nFinal Test Results:")
+        logger.info(f"Test Loss: {test_loss:.4f}")
+        logger.info(f"Test Accuracy: {test_acc:.4f}")
 
-        # Save best model
-        if val_metrics['known_accuracy'] > best_val_acc:
-            best_val_acc = val_metrics['known_accuracy']
-            torch.save({
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'epoch': epoch,
-                'val_accuracy': best_val_acc
-            }, best_model_path)
-
-        # Analyze and save drift patterns
-        if epoch % 10 == 0:  # Every 10 epochs
-            save_drift_analysis(drift_analyzer, output_dir / f'drift_analysis_epoch_{epoch}')
-
-    # Final evaluation on test set
-    logger.info("Loading best model for final evaluation...")
-    checkpoint = torch.load(best_model_path)
-    model.load_state_dict(checkpoint['model_state_dict'])
-    
-    test_metrics = evaluate_temporal(model, classifier, test_loader, device)
-    logger.info("\nFinal Test Results:")
-    logger.info(f"Known Family Accuracy: {test_metrics['known_accuracy']:.4f}")
-    logger.info(f"New Family Detection Rate: {test_metrics['new_detection_rate']:.4f}")
-    logger.info(f"False Positive Rate: {test_metrics['false_positive_rate']:.4f}")
-
-    # Save final evolution analysis
-    save_final_analysis(
-        classifier=classifier,
-        drift_analyzer=drift_analyzer,
-        test_metrics=test_metrics,
-        output_dir=output_dir
-    )
-
-def save_drift_analysis(drift_analyzer, output_path):
-    """Save drift analysis results and visualizations."""
-    output_path = Path(output_path)
-    output_path.mkdir(parents=True, exist_ok=True)
-
-    # Save summaries for each family
-    summaries = {}
-    for family in drift_analyzer.family_trajectories:
-        summaries[family] = drift_analyzer.get_family_evolution_summary(family)
-
-    with open(output_path / 'evolution_summaries.json', 'w') as f:
-        json.dump(summaries, f, indent=2, default=str)
-
-    # Create visualizations
-    plot_drift_patterns(drift_analyzer, output_path)
-
-def plot_drift_patterns(drift_analyzer, output_path):
-    """Create visualizations of drift patterns."""
-    # Plot total drift over time
-    plt.figure(figsize=(12, 8))
-    for family in drift_analyzer.family_trajectories:
-        timestamps = [t['timestamp'] for t in drift_analyzer.family_trajectories[family]]
-        drifts = np.cumsum([np.linalg.norm(t['embedding']) 
-                           for t in drift_analyzer.family_trajectories[family]])
-        plt.plot(timestamps, drifts, label=family)
-    
-    plt.xlabel('Time')
-    plt.ylabel('Cumulative Drift')
-    plt.title('Family Evolution Over Time')
-    plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
-    plt.tight_layout()
-    plt.savefig(output_path / 'drift_patterns.png')
-    plt.close()
-
-def save_final_analysis(classifier, drift_analyzer, test_metrics, output_dir):
-    """Save final analysis results."""
-    results = {
-        'test_metrics': test_metrics,
-        'family_evolution': {
-            family: drift_analyzer.get_family_evolution_summary(family)
-            for family in drift_analyzer.family_trajectories
-        },
-        'behavioral_groups': classifier.group_mappings
-    }
-
-    with open(output_dir / 'final_analysis.json', 'w') as f:
-        json.dump(results, f, indent=2, default=str)
+    except Exception as e:
+        logger.error(f"An error occurred during execution: {str(e)}")
+        raise
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        logger.error(f"Fatal error: {str(e)}")
+        sys.exit(1)
