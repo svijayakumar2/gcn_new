@@ -927,7 +927,7 @@ def load_batch(batch_file, family_to_group, batch_size=32):
             
         # Load batch from file
         batch_data = torch.load(batch_file)
-        print("Batch families:", [getattr(g, 'family', 'none') for g in batch_data])
+        #print("Batch families:", [getattr(g, 'family', 'none') for g in batch_data])
         if not batch_data:
             logger.warning(f"Empty batch file: {batch_file}")
             return None

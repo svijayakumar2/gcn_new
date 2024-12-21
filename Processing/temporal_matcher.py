@@ -270,7 +270,7 @@ def main():
         primary_metadata_path='bodmas_metadata_cleaned.csv',
         malware_types_path='bodmas_malware_category.csv',  # Add path to your malware types file
         data_dir='cfg_analysis_results/cfg_analysis_results',
-        output_dir='bodmas_batches',
+        output_dir='bodmas_batches_test',
         batch_size=100,
         train_ratio=0.7,
         val_ratio=0.15

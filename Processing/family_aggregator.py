@@ -441,8 +441,13 @@ class MalwareBehaviorAggregator:
                     logger.warning(f"No valid data for family {family}")
             except Exception as e:
                 logger.error(f"Error processing family {family}: {str(e)}")
+                print(family)
                 continue
-                
+        # print num family_distribution
+        print('Number of family_distributions')
+        print(len(self.family_distributions))
+        print('Number of family_graphs')
+        print(len(self.family_graphs))
         if not self.family_distributions:
             logger.error("No family distributions were successfully processed")
         else:
@@ -525,6 +530,24 @@ class MalwareBehaviorAggregator:
             else:
                 logger.info(f"Families: {', '.join(group_families)}")
         
+
+        # Verify all families are assigned
+        all_families = set(self.family_distributions.keys())
+        assigned_families = set(family for group in behavioral_groups.values() for family in group)
+        missing_families = all_families - assigned_families
+
+        if missing_families:
+            logger.warning(f"Found {len(missing_families)} unassigned families - assigning them to new groups")
+            
+            # Assign each missing family to its own new group
+            max_group = max(behavioral_groups.keys()) if behavioral_groups else -1
+            for i, family in enumerate(missing_families):
+                behavioral_groups[max_group + i + 1] = [family]
+
+        # Log final counts to verify
+        total_families = len(all_families)
+        total_assigned = sum(len(families) for families in behavioral_groups.values())
+        logger.info(f"Total families: {total_families}, Total assigned: {total_assigned}")
         return behavioral_groups, similarity_matrix
                     
     def _find_optimal_clusters(self, distance_matrix: np.ndarray, malware_families: list) -> tuple:
@@ -537,7 +560,7 @@ class MalwareBehaviorAggregator:
         min_clusters = len(unique_types)  # At least one cluster per malware type
         
         # Test range of cluster numbers
-        n_cluster_range = range(min_clusters, min_clusters + 20, 2)
+        n_cluster_range = range(2, min(len(malware_families) - 1, min_clusters + 20), 2)
         scores = []
         clustering_results = []
         
