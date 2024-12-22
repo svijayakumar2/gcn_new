@@ -537,13 +537,13 @@ class FamilyDriftAnalyzer:
         return 1.0 / (1.0 + np.mean(distances))
 
 
-class TemporalMalwareClassifier:
-    def __init__(self, behavioral_groups_path: str, embedding_dim: int = 256):
-        self.group_mappings = self._load_groups(behavioral_groups_path)
-        self.embedding_dim = embedding_dim
-        self.family_centroids = {}
-        self.temporal_statistics = defaultdict(list)
-        self.distance_threshold = None
+# class TemporalMalwareClassifier:
+#     def __init__(self, behavioral_groups_path: str, embedding_dim: int = 256):
+#         self.group_mappings = self._load_groups(behavioral_groups_path)
+#         self.embedding_dim = embedding_dim
+#         self.family_centroids = {}
+#         self.temporal_statistics = defaultdict(list)
+#         self.distance_threshold = None
 
 
 class TemporalMalwareClassifier:
@@ -557,9 +557,12 @@ class TemporalMalwareClassifier:
         self.family_centroids = {}
         self.temporal_statistics = defaultdict(list)
         self.distance_threshold = None
+        # Add monitoring for unknown families
+        self.unknown_families_count = 0
+        self.unknown_families_set = set()
     
     def _load_groups(self, path: str) -> dict:
-        """Load behavioral groups from JSON file.
+        """Load behavioral groups from JSON file with support for unknown families.
         
         Args:
             path (str): Path to JSON file containing group mappings in format:
@@ -577,13 +580,18 @@ class TemporalMalwareClassifier:
             family_to_group = {}
             group_to_families = {}
             
+            # Initialize special group for unknown families
+            unknown_group_id = -999  # Use a special ID for unknown group
+            group_to_families[unknown_group_id] = []
+            
+            # Load known groups
             for group_id, families in group_data.items():
                 group_id = int(group_id)  # Convert string group ID to int
                 group_to_families[group_id] = families
                 for family in families:
                     family_to_group[family] = group_id
-                    
-            logger.info(f"Loaded {len(family_to_group)} families in {len(group_to_families)} groups")
+            
+            logger.info(f"Initially loaded {len(family_to_group)} families in {len(group_to_families)-1} groups")
             
             return {
                 'family_to_group': family_to_group,
@@ -593,6 +601,20 @@ class TemporalMalwareClassifier:
         except Exception as e:
             logger.error(f"Error loading groups from {path}: {str(e)}")
             raise
+            
+    def get_or_add_family_group(self, family_name: str) -> int:
+        """Get group ID for a family, adding to unknown group if not found."""
+        if family_name not in self.group_mappings['family_to_group']:
+            self.group_mappings['family_to_group'][family_name] = -999
+            self.group_mappings['group_to_families'][-999].append(family_name)
+            self.unknown_families_count += 1
+            self.unknown_families_set.add(family_name)
+            logger.warning(
+                f"Added unknown family '{family_name}' to unknown group "
+                f"(Total unknown families: {len(self.unknown_families_set)})"
+            )
+        return self.group_mappings['family_to_group'][family_name]
+
     def detect_new_families(self, embeddings: torch.Tensor) -> List[bool]:
         """Detect potential new families based on distance to existing centroids."""
         with torch.no_grad():  # Ensure no gradients are tracked
@@ -669,37 +691,37 @@ class TemporalMalwareClassifier:
             logger.warning("No distances computed for threshold calculation")
 
             
-    def update_centroids(self, model, loader, device):
-        """Update family centroids using current model embeddings."""
-        model.eval()  # Set model to evaluation mode
-        family_embeddings = defaultdict(list)
+    # def update_centroids(self, model, loader, device):
+    #     """Update family centroids using current model embeddings."""
+    #     model.eval()  # Set model to evaluation mode
+    #     family_embeddings = defaultdict(list)
         
-        with torch.no_grad():  # Ensure no gradients are tracked
-            for batch in loader:
-                batch = batch.to(device)
-                embeddings = model.get_embeddings(batch)
+    #     with torch.no_grad():  # Ensure no gradients are tracked
+    #         for batch in loader:
+    #             batch = batch.to(device)
+    #             embeddings = model.get_embeddings(batch)
                 
-                # Safely convert embeddings to numpy
-                embeddings_np = embeddings.cpu().numpy()
+    #             # Safely convert embeddings to numpy
+    #             embeddings_np = embeddings.cpu().numpy()
                 
-                for emb, family, timestamp in zip(embeddings_np, batch.family, batch.timestamp):
-                    family_embeddings[family].append({
-                        'embedding': emb,
-                        'timestamp': pd.to_datetime(timestamp)
-                    })
+    #             for emb, family, timestamp in zip(embeddings_np, batch.family, batch.timestamp):
+    #                 family_embeddings[family].append({
+    #                     'embedding': emb,
+    #                     'timestamp': pd.to_datetime(timestamp)
+    #                 })
         
-        # Process the collected embeddings
-        for family, embeds in family_embeddings.items():
-            sorted_embeds = sorted(embeds, key=lambda x: x['timestamp'])
-            weights = np.exp(np.linspace(-1, 0, len(sorted_embeds)))
-            weighted_embeddings = np.vstack([e['embedding'] for e in sorted_embeds])
-            weighted_centroid = np.average(weighted_embeddings, weights=weights, axis=0)
+    #     # Process the collected embeddings
+    #     for family, embeds in family_embeddings.items():
+    #         sorted_embeds = sorted(embeds, key=lambda x: x['timestamp'])
+    #         weights = np.exp(np.linspace(-1, 0, len(sorted_embeds)))
+    #         weighted_embeddings = np.vstack([e['embedding'] for e in sorted_embeds])
+    #         weighted_centroid = np.average(weighted_embeddings, weights=weights, axis=0)
             
-            self.family_centroids[family] = {
-                'centroid': weighted_centroid,
-                'last_updated': sorted_embeds[-1]['timestamp'],
-                'num_samples': len(sorted_embeds)
-            }
+    #         self.family_centroids[family] = {
+    #             'centroid': weighted_centroid,
+    #             'last_updated': sorted_embeds[-1]['timestamp'],
+    #             'num_samples': len(sorted_embeds)
+    #         }
     
     def compute_distance_threshold(self, model, loader, device, percentile=95):
         """Compute distance threshold for new family detection."""
@@ -729,33 +751,39 @@ class TemporalMalwareClassifier:
 
 
 def evaluate_predictions(group_logits, family_logits, true_families, 
-                       new_family_flags, group_mappings):
-    """Evaluate predictions for a batch."""
+                       new_family_flags, group_mappings, classifier=None):
+    """Evaluate predictions for a batch with unknown family handling."""
     pred_groups = group_logits.argmax(dim=1)
     metrics = defaultdict(list)
     
     for i, (pred_group, true_family, is_new) in enumerate(
             zip(pred_groups, true_families, new_family_flags)):
         
-        true_group = group_mappings['family_to_group'][true_family]
+        # Use the classifier's unknown family handling if available
+        if classifier and hasattr(classifier, 'get_or_add_family_group'):
+            true_group = classifier.get_or_add_family_group(true_family)
+        else:
+            # Fallback to default behavior with unknown group
+            true_group = group_mappings['family_to_group'].get(true_family, -999)
         
         # Group accuracy
         group_correct = (pred_group.item() == true_group)
         metrics['group_accuracy'].append(group_correct)
         
-        # Family prediction accuracy
-        if not is_new:
+        # Family prediction accuracy (only for known families)
+        if not is_new and true_group != -999:
             family_logits_group = family_logits[str(pred_group.item())][i]
             pred_family_idx = family_logits_group.argmax().item()
             pred_family = group_mappings['group_to_families'][pred_group.item()][pred_family_idx]
             metrics['accuracy'].append(pred_family == true_family)
         
-        # New family detection
-        metrics['new_family_detection'].append(
-            is_new == (true_family not in group_mappings['family_to_group'])
-        )
+        # Unknown family detection
+        is_unknown = true_group == -999
+        metrics['unknown_family_detection'].append(is_new == is_unknown)
     
     return {k: np.mean(v) for k, v in metrics.items()}
+
+from sklearn.metrics import precision_recall_fscore_support, accuracy_score
 
 class HierarchicalMalwareGNN(torch.nn.Module):
     def __init__(self, num_features, num_groups=16, embedding_dim=256):
@@ -1028,69 +1056,60 @@ def load_batch(batch_file, family_to_group, batch_size=32):
         return None
 
 def validate_model(model, val_loader, criterion, classifier, device):
-    """Validate model on validation set."""
+    """Validate model and return accuracy."""
     model.eval()
     total_loss = 0
-    num_batches = 0
-    metrics = defaultdict(list)
+    correct = 0
+    total = 0
+    
+    # Get valid groups (excluding unknown group -999)
+    valid_groups = set(classifier.group_mappings['family_to_group'].values())
+    valid_groups.discard(-999)  # Remove unknown group if present
     
     with torch.no_grad():
-        if isinstance(val_loader, str):
-            val_files = [val_loader]
-        elif isinstance(val_loader, (list, tuple)):
-            val_files = val_loader
-        else:
-            val_files = val_loader
-            
-        for batch_file in val_files:
-            # Load batch data
-            batch_loader = load_batch(
-                batch_file,
-                classifier.group_mappings['family_to_group']
-            )
+        for batch_file in val_loader:
+            batch_loader = load_batch(batch_file, classifier.group_mappings['family_to_group'])
             if not batch_loader:
                 continue
                 
             for batch in batch_loader:
-                try:
-                    # Move batch to device
-                    batch = batch.to(device)
-                    
-                    # Forward pass
-                    embeddings, group_logits, family_logits = model(batch)
-                    
-                    # Detect new families
-                    new_family_flags = classifier.detect_new_families(embeddings)
-                    
-                    # Compute loss
-                    loss = criterion(embeddings, group_logits, family_logits,
-                                   batch.family, device)
-                    total_loss += loss.item()
-                    num_batches += 1
-                    
-                    # Compute batch metrics
-                    batch_metrics = evaluate_predictions(
-                        group_logits, family_logits,
-                        batch.family, new_family_flags,
-                        classifier.group_mappings
-                    )
-                    
-                    for k, v in batch_metrics.items():
-                        metrics[k].append(v)
-                        
-                except RuntimeError as e:
-                    logger.error(f"Error processing validation batch: {str(e)}")
-                    continue
+                batch = batch.to(device)
+                
+                # Forward pass
+                embeddings, group_logits, family_logits = model(batch)
+                
+                # Zero out logits for invalid groups to prevent predicting them
+                invalid_mask = torch.ones_like(group_logits, dtype=torch.bool)
+                for i in valid_groups:
+                    invalid_mask[:, i] = False
+                group_logits[invalid_mask] = float('-inf')
+                
+                # Get predictions
+                pred_groups = group_logits.argmax(dim=1)
+                
+                # Get true labels
+                true_groups = torch.tensor([
+                    classifier.group_mappings['family_to_group'].get(fam, -999) 
+                    for fam in batch.family
+                ]).to(device)
+                
+                # Only count accuracy for known groups
+                mask = true_groups != -999
+                if mask.any():
+                    correct += (pred_groups[mask] == true_groups[mask]).sum().item()
+                    total += mask.sum().item()
+                
+                # Calculate loss
+                loss = criterion(embeddings, group_logits, family_logits,
+                               batch.family, device)
+                total_loss += loss.item()
     
-    # Compute average metrics
-    avg_metrics = {
-        'val_loss': total_loss / max(1, num_batches)
-    }
-    avg_metrics.update({
-        k: np.mean(v) for k, v in metrics.items()
-    })
+    accuracy = correct / total if total > 0 else 0
+    avg_loss = total_loss / total if total > 0 else 0
     
-    return avg_metrics
+    logger.info(f"\nValidation - Loss: {avg_loss:.4f}, Accuracy: {accuracy:.4f}")
+    
+    return {'loss': avg_loss, 'accuracy': accuracy}
 
 def train_temporal(model, classifier, train_loader, val_loader, optimizer, criterion, 
                   device, drift_analyzer, num_epochs=10):
@@ -1419,7 +1438,7 @@ def main():
         # Load best model for final evaluation
         logger.info("Loading best model for final evaluation...")
         try:
-            checkpoint = torch.load('best_temporal_model.pt', map_location=device)
+            checkpoint = torch.load('best_model.pt', map_location=device)
             model.load_state_dict(checkpoint['model_state_dict'])
         except Exception as e:
             logger.error(f"Error loading best model: {str(e)}")
