@@ -20,7 +20,6 @@ from torch_geometric.data import DataLoader
 from torch_geometric.data import Data, Batch
 
 
-
 class HierarchicalLoss(torch.nn.Module):
     def __init__(self, family_to_group, alpha=0.3):
         """
@@ -123,21 +122,6 @@ class HierarchicalLoss(torch.nn.Module):
         
         return total_loss
     
-def save_analysis_results(output_dir: Path, classifier,
-                            drift_analyzer, final_metrics: dict):
-    """Save analysis results to output directory."""
-    # Save family centroids
-    with open(output_dir / 'family_centroids.json', 'w') as f:
-        json.dump(classifier.family_centroids, f)
-    
-    # Save drift metrics
-    with open(output_dir / 'drift_metrics.json', 'w') as f:
-        json.dump(drift_analyzer.drift_metrics, f)
-    
-    # Save final metrics
-    with open(output_dir / 'final_metrics.json', 'w') as f:
-        json.dump(final_metrics, f)
-    
 
 
 logging.basicConfig(
@@ -150,6 +134,43 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+
+
+def save_analysis_results(output_dir: Path, classifier, drift_analyzer, final_metrics: dict):
+    """Save analysis results to output directory with proper handling of numpy arrays."""
+    # Convert numpy arrays to lists for JSON serialization
+    def convert_to_serializable(obj):
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        elif isinstance(obj, dict):
+            return {k: convert_to_serializable(v) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [convert_to_serializable(item) for item in obj]
+        elif isinstance(obj, np.float32):
+            return float(obj)
+        return obj
+    
+    # Save family centroids
+    centroids_dict = {}
+    for family, data in classifier.family_centroids.items():
+        centroids_dict[family] = {
+            'centroid': convert_to_serializable(data['centroid']),
+            'last_updated': data['last_updated'].isoformat(),
+            'num_samples': data['num_samples']
+        }
+    
+    with open(output_dir / 'family_centroids.json', 'w') as f:
+        json.dump(centroids_dict, f, indent=2)
+    
+    # Save drift metrics
+    drift_metrics_serializable = convert_to_serializable(drift_analyzer.drift_metrics)
+    with open(output_dir / 'drift_metrics.json', 'w') as f:
+        json.dump(drift_metrics_serializable, f, indent=2)
+    
+    # Save final metrics
+    final_metrics_serializable = convert_to_serializable(final_metrics)
+    with open(output_dir / 'final_metrics.json', 'w') as f:
+        json.dump(final_metrics_serializable, f, indent=2)
 
 class FamilyDriftAnalyzer:
     def __init__(self, embedding_dim: int = 256):
@@ -841,101 +862,6 @@ class HierarchicalMalwareGNN(torch.nn.Module):
             
         return embeddings, group_logits, family_logits
 
-
-def evaluate(model, split_files, family_to_group, device, criterion, batch_size=32):
-    """Evaluate the model."""
-    model.eval()
-    total_loss = 0
-    num_batches = 0
-    correct = 0
-    total = 0
-    
-    with torch.no_grad():
-        for batch_file in split_files:
-            # Load batch data
-            batch_loader = load_batch(batch_file, family_to_group, batch_size=batch_size)
-            if not batch_loader:
-                continue
-            
-            for batch in batch_loader:
-                try:
-                    # Move batch to device
-                    batch = batch.to(device)
-                    
-                    # Forward pass
-                    embeddings, group_logits, family_logits = model(batch)
-                    
-                    # Get predictions
-                    pred_groups = group_logits.argmax(dim=1)
-                    true_groups = torch.tensor([
-                        family_to_group.get(fam, -1) for fam in batch.family
-                    ]).to(device)
-                    
-                    # Compute metrics
-                    correct += (pred_groups == true_groups).sum().item()
-                    total += len(true_groups)
-                    
-                    # Compute loss
-                    loss = criterion(embeddings, group_logits, family_logits, batch.family, device)
-                    total_loss += loss.item()
-                    num_batches += 1
-                    
-                except RuntimeError as e:
-                    logger.error(f"Error processing batch: {str(e)}")
-                    continue
-    
-    accuracy = correct / max(1, total)
-    avg_loss = total_loss / max(1, num_batches)
-    return avg_loss, accuracy
-
-
-
-def evaluate(model, split_files, family_to_group, device, criterion, batch_size=32):
-    """Evaluate the model."""
-    model.eval()
-    total_loss = 0
-    num_batches = 0
-    correct = 0
-    total = 0
-    
-    with torch.no_grad():
-        for batch_file in split_files:
-            # Load batch data
-            batch_loader = load_batch(batch_file, family_to_group, batch_size=batch_size)
-            if not batch_loader:
-                continue
-            
-            for batch in batch_loader:
-                try:
-                    # Move batch to device
-                    batch = batch.to(device)
-                    
-                    # Forward pass
-                    embeddings, group_logits, family_logits = model(batch)
-                    
-                    # Get predictions
-                    pred_groups = group_logits.argmax(dim=1)
-                    true_groups = torch.tensor([
-                        family_to_group.get(fam, -1) for fam in batch.family
-                    ]).to(device)
-                    
-                    # Compute metrics
-                    correct += (pred_groups == true_groups).sum().item()
-                    total += len(true_groups)
-                    
-                    # Compute loss
-                    loss = criterion(embeddings, group_logits, family_logits, batch.family, device)
-                    total_loss += loss.item()
-                    num_batches += 1
-                    
-                except RuntimeError as e:
-                    logger.error(f"Error processing batch: {str(e)}")
-                    continue
-    
-    accuracy = correct / max(1, total)
-    avg_loss = total_loss / max(1, num_batches)
-    return avg_loss, accuracy
-
                    
 def load_batch(batch_file, family_to_group, batch_size=32):
     """Load and preprocess a single batch file with robust error handling.
@@ -1055,20 +981,18 @@ def load_batch(batch_file, family_to_group, batch_size=32):
         logger.error(f"Error loading batch {batch_file}: {str(e)}")
         return None
 
-def validate_model(model, val_loader, criterion, classifier, device):
-    """Validate model and return accuracy."""
+def evaluate_detailed(model, split_files, classifier, device, criterion, batch_size=32):
+    """Evaluate the model with detailed metrics per family and group."""
     model.eval()
-    total_loss = 0
-    correct = 0
-    total = 0
-    
-    # Get valid groups (excluding unknown group -999)
-    valid_groups = set(classifier.group_mappings['family_to_group'].values())
-    valid_groups.discard(-999)  # Remove unknown group if present
+    metrics = {
+        'total_loss': 0,
+        'num_batches': 0,
+        'predictions': []  # Store all predictions for confusion matrix
+    }
     
     with torch.no_grad():
-        for batch_file in val_loader:
-            batch_loader = load_batch(batch_file, classifier.group_mappings['family_to_group'])
+        for batch_file in split_files:
+            batch_loader = load_batch(batch_file, classifier.group_mappings['family_to_group'], batch_size=batch_size)
             if not batch_loader:
                 continue
                 
@@ -1078,39 +1002,184 @@ def validate_model(model, val_loader, criterion, classifier, device):
                 # Forward pass
                 embeddings, group_logits, family_logits = model(batch)
                 
-                # Zero out logits for invalid groups to prevent predicting them
-                invalid_mask = torch.ones_like(group_logits, dtype=torch.bool)
-                for i in valid_groups:
-                    invalid_mask[:, i] = False
-                group_logits[invalid_mask] = float('-inf')
-                
-                # Get predictions
+                # Get group predictions
                 pred_groups = group_logits.argmax(dim=1)
-                
-                # Get true labels
                 true_groups = torch.tensor([
-                    classifier.group_mappings['family_to_group'].get(fam, -999) 
+                    classifier.group_mappings['family_to_group'].get(fam, -1) 
                     for fam in batch.family
                 ]).to(device)
                 
-                # Only count accuracy for known groups
-                mask = true_groups != -999
-                if mask.any():
-                    correct += (pred_groups[mask] == true_groups[mask]).sum().item()
-                    total += mask.sum().item()
+                # Get family predictions for each group
+                pred_families = []
+                for i, (pred_group, true_family) in enumerate(zip(pred_groups, batch.family)):
+                    group_id = str(pred_group.item())
+                    if group_id in family_logits:
+                        family_logits_group = family_logits[group_id][i]
+                        pred_family_idx = family_logits_group.argmax().item()
+                        if pred_group.item() in classifier.group_mappings['group_to_families']:
+                            families = classifier.group_mappings['group_to_families'][pred_group.item()]
+                            if pred_family_idx < len(families):
+                                pred_family = families[pred_family_idx]
+                            else:
+                                pred_family = 'unknown'
+                        else:
+                            pred_family = 'unknown'
+                    else:
+                        pred_family = 'unknown'
+                    pred_families.append(pred_family)
                 
-                # Calculate loss
-                loss = criterion(embeddings, group_logits, family_logits,
-                               batch.family, device)
-                total_loss += loss.item()
+                # Store predictions
+                for pred_group, true_group, pred_family, true_family in zip(
+                    pred_groups, true_groups, pred_families, batch.family
+                ):
+                    metrics['predictions'].append({
+                        'pred_group': pred_group.item(),
+                        'true_group': true_group.item(),
+                        'pred_family': pred_family,
+                        'true_family': true_family
+                    })
+                
+                # Compute loss
+                loss = criterion(embeddings, group_logits, family_logits, batch.family, device)
+                metrics['total_loss'] += loss.item()
+                metrics['num_batches'] += 1
     
-    accuracy = correct / total if total > 0 else 0
-    avg_loss = total_loss / total if total > 0 else 0
-    
-    logger.info(f"\nValidation - Loss: {avg_loss:.4f}, Accuracy: {accuracy:.4f}")
-    
-    return {'loss': avg_loss, 'accuracy': accuracy}
+    return compute_final_metrics(metrics, classifier)
 
+def compute_final_metrics(metrics, classifier):
+    """Compute final metrics including precision, recall, and F1 score."""
+    final_metrics = {
+        'avg_loss': float(metrics['total_loss']) / max(1, metrics['num_batches']),
+        'group_metrics': {},
+        'family_metrics': {},
+        'overall': {}
+    }
+    
+    # Compute group-level metrics
+    all_group_preds = []
+    all_group_true = []
+    
+    for pred in metrics['predictions']:
+        if pred['true_group'] != -1:  # Skip unknown groups
+            all_group_preds.append(pred['pred_group'])
+            all_group_true.append(pred['true_group'])
+    
+    if all_group_preds:
+        group_precision, group_recall, group_f1, _ = precision_recall_fscore_support(
+            all_group_true, all_group_preds, average='weighted', zero_division=0
+        )
+        group_accuracy = accuracy_score(all_group_true, all_group_preds)
+        
+        final_metrics['overall']['group'] = {
+            'precision': float(group_precision),
+            'recall': float(group_recall),
+            'f1': float(group_f1),
+            'accuracy': float(group_accuracy)
+        }
+    
+    # Compute per-group metrics
+    unique_groups = set(pred['true_group'] for pred in metrics['predictions'])
+    for group_id in unique_groups:
+        if group_id == -1:  # Skip unknown group
+            continue
+            
+        # Binary classification for this group
+        true_labels = []
+        pred_labels = []
+        for pred in metrics['predictions']:
+            if pred['true_group'] == group_id or pred['pred_group'] == group_id:
+                true_labels.append(1 if pred['true_group'] == group_id else 0)
+                pred_labels.append(1 if pred['pred_group'] == group_id else 0)
+        
+        if true_labels:
+            precision, recall, f1, _ = precision_recall_fscore_support(
+                true_labels, pred_labels, average='binary', zero_division=0
+            )
+            final_metrics['group_metrics'][str(group_id)] = {
+                'precision': float(precision),
+                'recall': float(recall),
+                'f1': float(f1)
+            }
+    
+    # Compute family-level overall metrics
+    all_family_preds = []
+    all_family_true = []
+    
+    for pred in metrics['predictions']:
+        if pred['true_family'] != 'unknown':
+            all_family_preds.append(pred['pred_family'])
+            all_family_true.append(pred['true_family'])
+    
+    if all_family_preds:
+        family_precision, family_recall, family_f1, _ = precision_recall_fscore_support(
+            all_family_true, all_family_preds, average='weighted', zero_division=0
+        )
+        family_accuracy = accuracy_score(all_family_true, all_family_preds)
+        
+        final_metrics['overall']['family'] = {
+            'precision': float(family_precision),
+            'recall': float(family_recall),
+            'f1': float(family_f1),
+            'accuracy': float(family_accuracy)
+        }
+    
+    # Compute per-family metrics
+    unique_families = set(pred['true_family'] for pred in metrics['predictions'])
+    for family in unique_families:
+        if family == 'unknown':
+            continue
+            
+        # Binary classification for this family
+        true_labels = []
+        pred_labels = []
+        for pred in metrics['predictions']:
+            if pred['true_family'] == family or pred['pred_family'] == family:
+                true_labels.append(1 if pred['true_family'] == family else 0)
+                pred_labels.append(1 if pred['pred_family'] == family else 0)
+        
+        if true_labels:
+            precision, recall, f1, _ = precision_recall_fscore_support(
+                true_labels, pred_labels, average='binary', zero_division=0
+            )
+            final_metrics['family_metrics'][family] = {
+                'precision': float(precision),
+                'recall': float(recall),
+                'f1': float(f1),
+                'total_samples': sum(1 for pred in metrics['predictions'] 
+                                   if pred['true_family'] == family)
+            }
+    
+    return final_metrics
+
+def log_evaluation_results(metrics: dict):
+    """Log detailed evaluation results."""
+    logger.info("\nEvaluation Results:")
+    
+    # Log overall metrics
+    if 'overall' in metrics:
+        for level in ['group', 'family']:
+            if level in metrics['overall']:
+                logger.info(f"\n{level.capitalize()} Level Overall Metrics:")
+                for metric, value in metrics['overall'][level].items():
+                    logger.info(f"{metric}: {value:.4f}")
+    
+    # Log group metrics
+    logger.info("\nBehavioral Group Metrics:")
+    for group_id, group_metrics in metrics['group_metrics'].items():
+        logger.info(f"\nGroup {group_id}:")
+        for metric, value in group_metrics.items():
+            logger.info(f"{metric}: {value:.4f}")
+    
+    # Log family metrics
+    logger.info("\nFamily Metrics:")
+    for family, family_metrics in metrics['family_metrics'].items():
+        logger.info(f"\nFamily {family}:")
+        for metric, value in family_metrics.items():
+            if isinstance(value, float):
+                logger.info(f"{metric}: {value:.4f}")
+            else:
+                logger.info(f"{metric}: {value}")
+                
 def train_temporal(model, classifier, train_loader, val_loader, optimizer, criterion, 
                   device, drift_analyzer, num_epochs=10):
     """Training loop with temporal analysis."""
@@ -1301,83 +1370,38 @@ def prepare_data(base_dir='bodmas_batches'):
     
     return dict(split_files), file_timestamps
 
-def evaluate(model, split_files, family_to_group, device, criterion, batch_size=32):
-    """Evaluate the model."""
-    model.eval()
-    total_loss = 0
-    num_batches = 0
-    correct = 0
-    total = 0
-    
-    with torch.no_grad():
-        for batch_file in split_files:
-            batch_loader = load_batch(batch_file, family_to_group, batch_size=batch_size)
-            if not batch_loader:
-                continue
-                
-            for batch in batch_loader:
-                # Forward pass
-                embeddings, group_logits, family_logits = model(batch)
-                
-                # Get predictions
-                pred_groups = group_logits.argmax(dim=1)
-                true_groups = torch.tensor([
-                    family_to_group.get(fam, -1) for fam in batch.family
-                ]).to(device)
-                
-                # Compute metrics
-                correct += (pred_groups == true_groups).sum().item()
-                total += len(true_groups)
-                
-                # Compute loss
-                loss = criterion(embeddings, group_logits, family_logits, batch.family, device)
-                total_loss += loss.item()
-                num_batches += 1
-    
-    accuracy = correct / max(1, total)
-    avg_loss = total_loss / max(1, num_batches)
-    return avg_loss, accuracy
-
 def main():
-    # Parse arguments
-    parser = argparse.ArgumentParser(description='Malware Family Evolution Analysis')
-    parser.add_argument('--batch_dir', type=str, default='bodmas_batches',
-                       help='Directory containing processed batches')
-    parser.add_argument('--behavioral_groups', type=str, required=True,
-                       help='Path to behavioral groups JSON')
-    parser.add_argument('--num_epochs', type=int, default=100,
-                       help='Number of training epochs')
-    parser.add_argument('--batch_size', type=int, default=32,
-                       help='Batch size for training')
-    parser.add_argument('--embedding_dim', type=int, default=256,
-                       help='Dimension of graph embeddings')
-    parser.add_argument('--output_dir', type=str, default='evolution_analysis',
-                       help='Directory for saving results')
-    parser.add_argument('--device', type=str, choices=['cuda', 'cpu'], 
-                       default='cuda' if torch.cuda.is_available() else 'cpu',
-                       help='Device to use for training')
-    args = parser.parse_args()
+    # Define configuration directly instead of using command-line arguments
+    config = {
+        'batch_dir': '/data/saranyav/gcn_new/bodmas_batches',
+        'behavioral_groups': '/data/saranyav/gcn_new/behavioral_analysis/behavioral_groups.json',
+        'embedding_dim': 256,
+        'num_epochs': 3,
+        'batch_size': 32,
+        'output_dir': 'evolution_analysis',
+        'device': 'cuda' if torch.cuda.is_available() else 'cpu'
+    }
 
     try:
         # Set up output directory
-        output_dir = Path(args.output_dir)
+        output_dir = Path(config['output_dir'])
         output_dir.mkdir(parents=True, exist_ok=True)
 
         # Set up device
-        device = torch.device(args.device)
+        device = torch.device(config['device'])
         logger.info(f"Using device: {device}")
 
         # Initialize temporal components
         logger.info("Initializing temporal components...")
         classifier = TemporalMalwareClassifier(
-            behavioral_groups_path=args.behavioral_groups,
-            embedding_dim=args.embedding_dim
+            behavioral_groups_path=config['behavioral_groups'],
+            embedding_dim=config['embedding_dim']
         )
-        drift_analyzer = FamilyDriftAnalyzer(embedding_dim=args.embedding_dim)
+        drift_analyzer = FamilyDriftAnalyzer(embedding_dim=config['embedding_dim'])
 
         # Prepare data
         logger.info("Preparing data...")
-        split_files, file_timestamps = prepare_data(args.batch_dir)
+        split_files, file_timestamps = prepare_data(config['batch_dir'])
         
         if not any(split_files.values()):
             logger.error("No data found!")
@@ -1397,7 +1421,7 @@ def main():
         model = HierarchicalMalwareGNN(
             num_features=num_features,
             num_groups=len(set(classifier.group_mappings['family_to_group'].values())),
-            embedding_dim=args.embedding_dim
+            embedding_dim=config['embedding_dim']
         )
 
         # Add family classifiers for each group
@@ -1414,7 +1438,6 @@ def main():
 
         # Training with temporal analysis
         logger.info("Starting training with temporal analysis...")
-        # Get file lists for each split
         train_files = split_files['train']
         val_files = split_files['val']
         test_files = split_files['test']
@@ -1432,7 +1455,7 @@ def main():
             criterion=criterion,
             device=device,
             drift_analyzer=drift_analyzer,
-            num_epochs=args.num_epochs
+            num_epochs=config['num_epochs']
         )
 
         # Load best model for final evaluation
@@ -1444,23 +1467,23 @@ def main():
             logger.error(f"Error loading best model: {str(e)}")
             return
         
-        # Final test evaluation
+        # Run detailed evaluation
         logger.info("Running final evaluation...")
-        test_loss, test_acc = evaluate(
+        test_metrics = evaluate_detailed(
             model=model,
-            split_files=split_files['test'],
-            family_to_group=classifier.group_mappings['family_to_group'],
+            split_files=test_files,
+            classifier=classifier,
             device=device,
             criterion=criterion,
-            batch_size=args.batch_size
+            batch_size=config['batch_size']
         )
         
         # Save final results
         logger.info("Saving analysis results...")
         final_metrics = {
-            'test_loss': test_loss,
-            'test_accuracy': test_acc,
-            'training_history': results
+            'test_metrics': test_metrics,
+            'training_history': results,
+            'config': config  # Save configuration for reference
         }
         
         try:
@@ -1468,10 +1491,8 @@ def main():
         except Exception as e:
             logger.error(f"Error saving results: {str(e)}")
         
-        # Log final results
-        logger.info("\nFinal Test Results:")
-        logger.info(f"Test Loss: {test_loss:.4f}")
-        logger.info(f"Test Accuracy: {test_acc:.4f}")
+        # Log detailed evaluation results
+        log_evaluation_results(test_metrics)
 
     except Exception as e:
         logger.error(f"An error occurred during execution: {str(e)}")
