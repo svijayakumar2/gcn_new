@@ -219,13 +219,15 @@ class FamilyDriftAnalyzer:
     def _compute_total_drift(self, embeddings: np.ndarray) -> float:
         """Compute total drift as path length in embedding space."""
         return np.sum(np.linalg.norm(embeddings[1:] - embeddings[:-1], axis=1))
-    
-    def _compute_drift_velocity(self, embeddings: np.ndarray, 
-                              timestamps: np.ndarray) -> np.ndarray:
+        
+    def _compute_drift_velocity(self, embeddings: np.ndarray, timestamps: np.ndarray) -> np.ndarray:
         """Compute drift velocity over time."""
         time_deltas = np.diff(timestamps).astype('timedelta64[s]').astype(float)
         displacement = embeddings[1:] - embeddings[:-1]
-        return displacement / time_deltas[:, np.newaxis]
+        
+        # Handle zero time deltas
+        time_deltas = np.where(time_deltas == 0, np.inf, time_deltas)
+        return np.divide(displacement, time_deltas[:, np.newaxis], out=np.zeros_like(displacement), where=time_deltas[:, np.newaxis]!=0)
     
     def _compute_drift_acceleration(self, embeddings: np.ndarray, 
                                   timestamps: np.ndarray) -> np.ndarray:
@@ -369,13 +371,11 @@ class FamilyDriftAnalyzer:
 
 
 class FamilyDriftAnalyzer:
-    """Analyze and track malware family evolution over time."""
-    
     def __init__(self, embedding_dim: int = 256):
         self.embedding_dim = embedding_dim
         self.family_trajectories = defaultdict(list)
         self.drift_metrics = defaultdict(dict)
-        
+    
     def track_family_drift(self, family: str, embedding: np.ndarray, timestamp: pd.Timestamp):
         """Track a family's position in embedding space over time."""
         self.family_trajectories[family].append({
@@ -389,16 +389,27 @@ class FamilyDriftAnalyzer:
         # Update drift metrics if we have enough data
         if len(self.family_trajectories[family]) > 1:
             self._update_drift_metrics(family)
-    
+        
     def _update_drift_metrics(self, family: str):
         """Compute drift metrics for a family."""
         trajectory = self.family_trajectories[family]
         
-        # Get time-ordered embeddings
+        # Get time-ordered embeddings and timestamps
         embeddings = np.vstack([t['embedding'] for t in trajectory])
         timestamps = np.array([t['timestamp'] for t in trajectory])
         
-        # Compute drift metrics
+        # If all timestamps are identical but we have multiple samples,
+        # artificially create small time differences
+        if len(timestamps) > 1 and np.all(timestamps == timestamps[0]):
+            # Create evenly spaced timestamps within the same second
+            base_timestamp = timestamps[0]
+            microsecond_offsets = np.linspace(0, 999999, len(timestamps))
+            timestamps = np.array([
+                base_timestamp + pd.Timedelta(microseconds=offset) 
+                for offset in microsecond_offsets
+            ])
+        
+        # Now compute drift metrics with the adjusted timestamps
         self.drift_metrics[family].update({
             'total_drift': self._compute_total_drift(embeddings),
             'drift_velocity': self._compute_drift_velocity(embeddings, timestamps),
@@ -409,25 +420,43 @@ class FamilyDriftAnalyzer:
     
     def _compute_total_drift(self, embeddings: np.ndarray) -> float:
         """Compute total drift as path length in embedding space."""
-        return np.sum(np.linalg.norm(embeddings[1:] - embeddings[:-1], axis=1))
+        return float(np.sum(np.linalg.norm(embeddings[1:] - embeddings[:-1], axis=1)))
     
-    def _compute_drift_velocity(self, embeddings: np.ndarray, 
-                              timestamps: np.ndarray) -> np.ndarray:
-        """Compute drift velocity over time."""
+    def _compute_drift_velocity(self, embeddings: np.ndarray, timestamps: np.ndarray) -> np.ndarray:
+        """Compute drift velocity over time with safe division."""
         time_deltas = np.diff(timestamps).astype('timedelta64[s]').astype(float)
         displacement = embeddings[1:] - embeddings[:-1]
-        return displacement / time_deltas[:, np.newaxis]
+        
+        # Add small epsilon to avoid division by zero
+        epsilon = 1e-10
+        safe_time_deltas = time_deltas + epsilon
+        
+        # Compute velocities
+        velocities = displacement / safe_time_deltas[:, np.newaxis]
+        
+        # Zero out velocities where time delta was too small
+        velocities[time_deltas < epsilon] = 0
+        
+        return velocities
     
-    def _compute_drift_acceleration(self, embeddings: np.ndarray, 
-                                  timestamps: np.ndarray) -> np.ndarray:
+    def _compute_drift_acceleration(self, embeddings: np.ndarray, timestamps: np.ndarray) -> np.ndarray:
         """Compute drift acceleration over time."""
         velocities = self._compute_drift_velocity(embeddings, timestamps)
         time_deltas = np.diff(timestamps[1:]).astype('timedelta64[s]').astype(float)
-        return np.diff(velocities, axis=0) / time_deltas[:, np.newaxis]
+        
+        # Add small epsilon to avoid division by zero
+        epsilon = 1e-10
+        safe_time_deltas = time_deltas + epsilon
+        
+        # Compute accelerations
+        accelerations = np.diff(velocities, axis=0) / safe_time_deltas[:, np.newaxis]
+        
+        # Zero out accelerations where time delta was too small
+        accelerations[time_deltas < epsilon] = 0
+        
+        return accelerations
     
-    def _identify_stability_periods(self, embeddings: np.ndarray, 
-                                  timestamps: np.ndarray, 
-                                  threshold: float = 0.1) -> List[Dict]:
+    def _identify_stability_periods(self, embeddings: np.ndarray, timestamps: np.ndarray, threshold: float = 0.1) -> List[Dict]:
         """Identify periods where family behavior remains stable."""
         velocities = self._compute_drift_velocity(embeddings, timestamps)
         speeds = np.linalg.norm(velocities, axis=1)
@@ -450,113 +479,49 @@ class FamilyDriftAnalyzer:
             
         return stable_periods
     
-    def _detect_major_shifts(self, embeddings: np.ndarray, 
-                           timestamps: np.ndarray, 
-                           threshold: float = 0.5) -> List[Dict]:
+    def _detect_major_shifts(self, embeddings: np.ndarray, timestamps: np.ndarray, threshold: float = 0.5) -> List[Dict]:
         """Detect major behavioral shifts in family evolution."""
         velocities = self._compute_drift_velocity(embeddings, timestamps)
         accelerations = self._compute_drift_acceleration(embeddings, timestamps)
         
         major_shifts = []
         
-        for i, (vel, acc, ts) in enumerate(zip(velocities[1:], accelerations, timestamps[2:])):
-            velocity_magnitude = np.linalg.norm(vel)
-            acceleration_magnitude = np.linalg.norm(acc)
-            
-            if (velocity_magnitude is not None and acceleration_magnitude is not None and velocity_magnitude > threshold and acceleration_magnitude > threshold):
-                shift_analysis = self._analyze_behavioral_shift(
-                    embeddings[i:i+3],
-                    velocities[i:i+2]
-                )
+        if len(accelerations) > 0:  # Only process if we have acceleration data
+            for i, (vel, acc, ts) in enumerate(zip(velocities[1:], accelerations, timestamps[2:])):
+                velocity_magnitude = np.linalg.norm(vel)
+                acceleration_magnitude = np.linalg.norm(acc)
                 
-                major_shifts.append({
-                    'timestamp': ts,
-                    'magnitude': velocity_magnitude,
-                    'acceleration': acceleration_magnitude,
-                    'analysis': shift_analysis
-                })
+                if velocity_magnitude > threshold and acceleration_magnitude > threshold:
+                    shift_analysis = self._analyze_behavioral_shift(
+                        embeddings[i:i+3],
+                        velocities[i:i+2]
+                    )
+                    
+                    major_shifts.append({
+                        'timestamp': ts,
+                        'magnitude': float(velocity_magnitude),
+                        'acceleration': float(acceleration_magnitude),
+                        'analysis': shift_analysis
+                    })
         
         return major_shifts
     
-    def _analyze_behavioral_shift(self, embeddings: np.ndarray, 
-                                velocities: np.ndarray) -> Dict:
+    def _analyze_behavioral_shift(self, embeddings: np.ndarray, velocities: np.ndarray) -> Dict:
         """Analyze the nature of a behavioral shift."""
-        direction = velocities[0] / np.linalg.norm(velocities[0])
-        temporary = np.dot(velocities[0], velocities[1]) < 0
-        distance = np.linalg.norm(embeddings[2] - embeddings[0])
+        v0_norm = np.linalg.norm(velocities[0])
+        if v0_norm > 0:
+            direction = velocities[0] / v0_norm
+        else:
+            direction = np.zeros_like(velocities[0])
+            
+        temporary = bool(np.dot(velocities[0], velocities[1]) < 0)
+        distance = float(np.linalg.norm(embeddings[2] - embeddings[0]))
         
         return {
             'temporary': temporary,
             'distance': distance,
-            'direction': direction
+            'direction': direction.tolist()  # Convert to list for JSON serialization
         }
-    
-    def get_family_evolution_summary(self, family: str) -> Dict:
-        """Get comprehensive evolution summary for a family."""
-        if family not in self.drift_metrics:
-            return None
-            
-        metrics = self.drift_metrics[family]
-        trajectory = self.family_trajectories[family]
-        
-        total_time = trajectory[-1]['timestamp'] - trajectory[0]['timestamp']
-        average_velocity = metrics['total_drift'] / total_time.total_seconds()
-        
-        return {
-            'first_seen': trajectory[0]['timestamp'],
-            'last_seen': trajectory[-1]['timestamp'],
-            'total_drift': metrics['total_drift'],
-            'average_velocity': average_velocity,
-            'stability_periods': len(metrics['stability_periods']),
-            'major_shifts': len(metrics['major_shifts']),
-            'evolution_phases': self._identify_evolution_phases(family)
-        }
-
-    def _identify_evolution_phases(self, family: str) -> List[Dict]:
-        """Identify distinct phases in family evolution."""
-        metrics = self.drift_metrics[family]
-        shifts = metrics['major_shifts']
-        
-        phases = []
-        last_phase_end = self.family_trajectories[family][0]['timestamp']
-        
-        for shift in shifts:
-            phases.append({
-                'start': last_phase_end,
-                'end': shift['timestamp'],
-                'duration': shift['timestamp'] - last_phase_end,
-                'stability': self._compute_phase_stability(family, last_phase_end, shift['timestamp'])
-            })
-            last_phase_end = shift['timestamp']
-        
-        final_timestamp = self.family_trajectories[family][-1]['timestamp']
-        phases.append({
-            'start': last_phase_end,
-            'end': final_timestamp,
-            'duration': final_timestamp - last_phase_end,
-            'stability': self._compute_phase_stability(family, last_phase_end, final_timestamp)
-        })
-        
-        return phases
-
-    def _compute_phase_stability(self, family: str, 
-                               start: pd.Timestamp, 
-                               end: pd.Timestamp) -> float:
-        """Compute stability metric for a specific phase."""
-        trajectory = self.family_trajectories[family]
-        phase_embeddings = [
-            t['embedding'] for t in trajectory 
-            if start <= t['timestamp'] <= end
-        ]
-        
-        if len(phase_embeddings) < 2:
-            return 1.0
-            
-        embeddings = np.vstack(phase_embeddings)
-        centroid = np.mean(embeddings, axis=0)
-        distances = np.linalg.norm(embeddings - centroid, axis=1)
-        return 1.0 / (1.0 + np.mean(distances))
-
 
 # class TemporalMalwareClassifier:
 #     def __init__(self, behavioral_groups_path: str, embedding_dim: int = 256):
@@ -1179,93 +1144,66 @@ def log_evaluation_results(metrics: dict):
                 logger.info(f"{metric}: {value:.4f}")
             else:
                 logger.info(f"{metric}: {value}")
-                
-def train_temporal(model, classifier, train_loader, val_loader, optimizer, criterion, 
-                  device, drift_analyzer, num_epochs=10):
-    """Training loop with temporal analysis."""
+
+def train_temporal(model, classifier, train_loader, val_loader, optimizer, criterion, device, drift_analyzer, num_epochs=10):
     best_val_loss = float('inf')
     results = []
-    
-    # Ensure model is on correct device
     model = model.to(device)
     
-    # Convert loaders to lists if they aren't already
     train_files = train_loader if isinstance(train_loader, (list, tuple)) else [train_loader]
     val_files = val_loader if isinstance(val_loader, (list, tuple)) else [val_loader]
+    
+    # Store all embeddings during training
+    all_embeddings = defaultdict(list)
     
     for epoch in range(num_epochs):
         model.train()
         total_loss = 0
         num_batches = 0
         
-        # Training
         for batch_file in train_files:
-            # Load batch data with new robust loader
-            batch_loader = load_batch(
-                batch_file, 
-                classifier.group_mappings['family_to_group']
-            )
-            
+            batch_loader = load_batch(batch_file, classifier.group_mappings['family_to_group'])
             if not batch_loader:
-                logger.warning(f"Skipping invalid batch file: {batch_file}")
                 continue
             
             for batch_data in batch_loader:
                 try:
-                    # Move batch to device
                     batch_data = batch_data.to(device)
-                    
                     optimizer.zero_grad()
                     
-                    # Forward pass
                     embeddings, group_logits, family_logits = model(batch_data)
-                    
-                    # Ensure family data is properly formatted for loss computation
                     batch_families = batch_data.family if isinstance(batch_data.family, list) else [batch_data.family]
                     
-                    # Debug information
-                    logger.debug(f"Batch shapes - embeddings: {embeddings.shape}, group_logits: {group_logits.shape}")
-                    logger.debug(f"Number of families in batch: {len(batch_families)}")
+                    # Store embeddings and timestamps
+                    embeddings_cpu = embeddings.detach().cpu().numpy()
+                    for emb, fam, ts in zip(embeddings_cpu, batch_families, batch_data.timestamp):
+                        all_embeddings[fam].append({
+                            'embedding': emb,
+                            'timestamp': pd.to_datetime(ts)
+                        })
                     
-                    # Compute loss with proper tensor handling
-                    loss = criterion(
-                        embeddings, 
-                        group_logits, 
-                        family_logits, 
-                        batch_families,
-                        device
-                    )
-                    
-                    # Backward pass
+                    loss = criterion(embeddings, group_logits, family_logits, batch_families, device)
                     loss.backward()
                     optimizer.step()
                     
-                    # Track metrics
                     total_loss += loss.item()
                     num_batches += 1
                     
-                except RuntimeError as e:
+                except Exception as e:
                     logger.error(f"Error processing batch: {str(e)}")
                     continue
         
         if num_batches == 0:
-            logger.error("No valid batches processed in epoch")
             continue
             
         avg_train_loss = total_loss / num_batches
+        val_metrics = validate_model(model, val_files, criterion, classifier, device)
         
-        # Validation
-        val_metrics = validate_model(
-            model, val_files, criterion, classifier, device
-        )
-        
-        # Log progress
         logger.info(f"Epoch {epoch}:")
         logger.info(f"Train Loss: {avg_train_loss:.4f}")
         logger.info(f"Val Loss: {val_metrics['val_loss']:.4f}")
         
-        # Save best model
-        if val_metrics.get('val_loss') is not None and (best_val_loss is None or val_metrics['val_loss'] < best_val_loss):
+        if val_metrics['val_loss'] < best_val_loss:
             best_val_loss = val_metrics['val_loss']
             torch.save({
                 'epoch': epoch,
@@ -1279,8 +1217,32 @@ def train_temporal(model, classifier, train_loader, val_loader, optimizer, crite
             'train_loss': avg_train_loss,
             'val_metrics': val_metrics
         })
+
+    # Compute drift metrics and update centroids after all epochs
+    logger.info("Computing final drift metrics and centroids...")
     
-    return results
+    # First update centroids as it's simpler
+    logger.info("Computing centroids...")
+    for family, samples in all_embeddings.items():
+        embeddings = np.vstack([s['embedding'] for s in samples])
+        centroid = np.mean(embeddings, axis=0)
+        last_timestamp = max(s['timestamp'] for s in samples)
+        classifier.family_centroids[family] = {
+            'centroid': centroid,
+            'last_updated': last_timestamp,
+            'num_samples': len(samples)
+        }
+
+    # Then do drift analysis for any families with >1 sample, with a progress log
+    logger.info("Computing drift metrics...")
+    total_families = len(all_embeddings)
+    for idx, (family, samples) in enumerate(all_embeddings.items(), 1):
+        if len(samples) > 1:  # Only compute drift for families with multiple samples
+            sorted_samples = sorted(samples, key=lambda x: x['timestamp'])
+            for sample in sorted_samples:
+                drift_analyzer.track_family_drift(family, sample['embedding'], sample['timestamp'])
+        if idx % 10 == 0:  # Log progress every 10 families
+            logger.info(f"Processed drift metrics for {idx}/{total_families} families")
 
 def validate_model(model, val_loader, criterion, classifier, device):
     """Validate model on validation set."""
@@ -1376,7 +1338,7 @@ def main():
         'batch_dir': '/data/saranyav/gcn_new/bodmas_batches',
         'behavioral_groups': '/data/saranyav/gcn_new/behavioral_analysis/behavioral_groups.json',
         'embedding_dim': 256,
-        'num_epochs': 3,
+        'num_epochs': 100,
         'batch_size': 32,
         'output_dir': 'evolution_analysis',
         'device': 'cuda' if torch.cuda.is_available() else 'cpu'
