@@ -129,12 +129,13 @@ class GraphConverter:
             edge_index = torch.tensor(graph_structure['edge_index'], dtype=torch.long).t() \
                 if graph_structure['edge_index'] else torch.zeros((2, 0), dtype=torch.long)
             
-            # Handle edge features if present
-            edge_attr = None
+            # Handle edge features if present, otherwise assign default edge attributes
             if graph_structure.get('edge_features'):
                 edge_feats = [[float(edge.get('condition', False) is not None)] 
                              for edge in graph_structure['edge_features']]
                 edge_attr = torch.tensor(edge_feats, dtype=torch.float)
+            else:
+                edge_attr = torch.zeros((edge_index.size(1), 1), dtype=torch.float)  # Default to zeros
             
             data = Data(x=x, edge_index=edge_index, edge_attr=edge_attr)
             data.num_nodes = x.size(0)
@@ -270,7 +271,7 @@ def main():
         primary_metadata_path='bodmas_metadata_cleaned.csv',
         malware_types_path='bodmas_malware_category.csv',  # Add path to your malware types file
         data_dir='cfg_analysis_results/cfg_analysis_results',
-        output_dir='bodmas_batches_test',
+        output_dir='bodmas_batches',
         batch_size=100,
         train_ratio=0.7,
         val_ratio=0.15
