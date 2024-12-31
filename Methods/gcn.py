@@ -11,6 +11,9 @@ from torch_geometric.data import DataLoader
 from sklearn.metrics import classification_report
 import numpy as np
 import sys 
+#cross entropy loss
+import torch.nn as nn
+import torch.nn.functional as F
 # from architectures import CentroidLayer, MalwareGNN
 
 logging.basicConfig(
@@ -32,64 +35,6 @@ from torch_geometric.nn import GCNConv
 from torch_geometric.nn import global_mean_pool
 
 
-class CentroidLayer(torch.nn.Module):
-  def __init__(self, input_dim, n_classes, n_centroids_per_class=None, ac_std_lim=5.0, reject_input=False, **kwargs):
-
-    super().__init__(**kwargs)
-
-    self.n_classes = n_classes
-    self.n = n_centroids_per_class or 1
-    self.input_dim = int(input_dim)
-    
-    self.centroids = torch.nn.Parameter(torch.randn(self.n_classes, self.n, self.input_dim))
-    self.std_scale = torch.nn.Parameter(torch.tensor(1.0))
-    self.ac_temp = torch.nn.Parameter(torch.tensor(1.0))
-
-    running_mean = torch.tensor(torch.tensor(1.0))
-    running_var = torch.tensor(torch.tensor(0.0))
-    ac_std_lim = torch.tensor(torch.tensor(ac_std_lim))
-    
-    self.register_buffer('running_mean', running_mean)
-    self.register_buffer('running_var', running_var)
-    self.register_buffer('ac_std_lim', ac_std_lim)
-
-    self.reject_input = reject_input
-    self.relu = torch.nn.ReLU()
-  
-  def forward(self, x):
-
-      # This has shape (batch_size, n_classes, centroids_per_class)
-      # Note: the [None] notation adds an extra dimension that we can
-      #    broadcast over.
-
-      dist_to_centroids = torch.sqrt(
-          torch.sum((self.centroids[None] - x[:, None, None])**2,
-                        dim=-1))
-
-      # This is the min distance to class centroids and has shape (batch_size, n_classes).
-      dist, _ = torch.min(dist_to_centroids, dim=2)
-      y = -dist
-
-      if self.reject_input:
-
-        if self.training:
-          mean_dist = torch.mean(torch.min(dist, dim=1)[0]).detach()
-          var_dist = torch.var(torch.min(dist, dim=1)[0]).detach()
-          self.running_mean = self.running_mean * 0.9 + mean_dist * 0.1
-          self.running_var = self.running_var * 0.9 + var_dist * 0.1
-
-        max_ac_dist = self.running_mean + torch.clip(self.relu(self.std_scale), min=0., max=self.ac_std_lim) * torch.sqrt(self.running_var)
-
-        # we accept if the distance is smaller than the max_ac_dist
-        # that is, if max_ac_dist - dist > 0, accept(x) = 1
-        accept_score = max_ac_dist - torch.min(dist, dim=1, keepdims=True)[0].detach()
-        soft_accept_score = accept_score / self.ac_temp
-        soft_accept_score = soft_accept_score.sigmoid()
-
-
-        return torch.cat([y, soft_accept_score], dim=1)
-
-      return y
 
 
 class GCN(torch.nn.Module):
@@ -126,224 +71,195 @@ from torch.nn import Linear
 import numpy as np
 from collections import Counter
 
-class MalwareGNN(torch.nn.Module):
-    def __init__(self, 
-                 num_node_features: int,
-                 hidden_dim: int = 128,
-                 num_classes: int = 18,  # Number of behavioral groups
-                 n_centroids_per_class: int = 2,
-                 dropout: float = 0.5):
-        super().__init__()
-        
-        # GNN layers
-        self.conv1 = GCNConv(num_node_features, hidden_dim)
-        self.conv2 = GCNConv(hidden_dim, hidden_dim)
-        self.conv3 = GCNConv(hidden_dim, hidden_dim)
-        
-        # Behavioral component with centroid layer
-        self.centroid = CentroidLayer(
-            input_dim=hidden_dim,
-            n_classes=num_classes,
-            n_centroids_per_class=n_centroids_per_class,
-            reject_input=True  # Enable outlier detection
-        )
-        
-        self.dropout = dropout
-        self.num_classes = num_classes
 
-    def forward(self, data):
-        x, edge_index, batch = data.x, data.edge_index, data.batch
-        
-        # Node embedding
-        x = self.conv1(x, edge_index)
-        x = F.relu(x)
-        x = F.dropout(x, p=self.dropout, training=self.training)
-        
-        x = self.conv2(x, edge_index)
-        x = F.relu(x)
-        x = F.dropout(x, p=self.dropout, training=self.training)
-        
-        x = self.conv3(x, edge_index)
-        
-        # Global pooling
-        x = global_mean_pool(x, batch)
-        
-        # Get behavioral patterns and outlier scores
-        out = self.centroid(x)
-        
-        # Split output into class logits and outlier scores
-        logits = out[:, :-1]  # All but last dimension
-        outlier_scores = out[:, -1]  # Last dimension
-        
-        return logits, outlier_scores
 
 class MalwareTrainer:
-    def __init__(self,
-                 model: MalwareGNN,
-                 device: torch.device,
-                 lr: float = 0.001,
-                 weight_decay: float = 5e-4):
+    def __init__(self, model, device):
         self.model = model
         self.device = device
-        self.optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+        self.optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
         
-    def compute_class_weights(self, loader) -> torch.Tensor:
-        """Compute inverse class weights to handle imbalance."""
-        label_counts = Counter()
+    def compute_class_weights(self, loader):
+        """Compute class weights with proper handling of unseen classes."""
+        num_classes = self.model.num_classes
+        if num_classes <= 0:
+            logger.error(f"Invalid number of classes: {num_classes}")
+            return None
+            
+        # Count samples per class
+        class_counts = torch.zeros(num_classes, device=self.device)
+        total_samples = 0
         
         for batch in loader:
-            labels = batch.y.cpu().numpy()
-            label_counts.update(labels)
+            if not hasattr(batch, 'y'):
+                continue
+            labels = batch.y
+            for label in range(num_classes):
+                count = (labels == label).sum().item()
+                class_counts[label] += count
+                total_samples += count
+        
+        if total_samples == 0:
+            logger.error("No valid samples found for computing class weights")
+            return None
             
-        # Calculate inverse weights
-        total_samples = sum(label_counts.values())
-        weights = torch.zeros(self.model.num_classes)
-        for label, count in label_counts.items():
-            weights[label] = total_samples / (self.model.num_classes * count)
-            
-        return weights.to(self.device)
-
-    def train_epoch(self, loader, class_weights: torch.Tensor = None):
+        # Compute weights with smoothing to handle zero counts
+        smoothing_factor = 0.1
+        smoothed_counts = class_counts + smoothing_factor
+        weights = total_samples / (num_classes * smoothed_counts)
+        
+        # Normalize weights
+        weights = weights / weights.sum() * num_classes
+        
+        logger.info(f"Class counts: {class_counts.tolist()}")
+        logger.info(f"Computed weights: {weights.tolist()}")
+        
+        return weights
+        
+    def train_epoch(self, loader, class_weights=None):
+        """Train for one epoch with robust error handling."""
         self.model.train()
         total_loss = 0
         correct = 0
         total = 0
-        outliers_detected = 0
         
-        for batch in loader:
-            self.optimizer.zero_grad()
-            batch = batch.to(self.device)
-            
-            # Forward pass
-            logits, outlier_scores = self.model(batch)
-            
-            # Classification loss with class weights
-            if class_weights is not None:
-                loss = F.cross_entropy(logits, batch.y, weight=class_weights)
-            else:
-                loss = F.cross_entropy(logits, batch.y)
-            
-            # Add outlier detection loss component
-            outlier_loss = -torch.mean(torch.log(outlier_scores + 1e-10))
-            combined_loss = loss + 0.1 * outlier_loss  # Weight factor for outlier loss
-            
-            combined_loss.backward()
-            self.optimizer.step()
-            
-            # Track metrics
-            total_loss += combined_loss.item()
-            pred = logits.argmax(dim=1)
-            correct += int((pred == batch.y).sum())
-            total += batch.y.size(0)
-            outliers_detected += int((outlier_scores < 0.5).sum())  # Threshold of 0.5
-            
-        accuracy = correct / total if total > 0 else 0
+        # Use default weights if none provided
+        if class_weights is None:
+            class_weights = torch.ones(self.model.num_classes, device=self.device)
+        
+        criterion = nn.CrossEntropyLoss(weight=class_weights)
+        
+        for batch_idx, batch in enumerate(loader):
+            try:
+                batch = batch.to(self.device)
+                self.optimizer.zero_grad()
+                
+                # Forward pass
+                output, outlier_scores = self.model(batch)
+                
+                # Ensure valid predictions
+                if output.size(1) != self.model.num_classes:
+                    raise ValueError(f"Model output size mismatch. Expected {self.model.num_classes}, got {output.size(1)}")
+                
+                # Compute loss
+                loss = criterion(output, batch.y)
+                
+                # Backward pass
+                loss.backward()
+                self.optimizer.step()
+                
+                # Track metrics
+                total_loss += loss.item()
+                pred = output.argmax(dim=1)
+                correct += pred.eq(batch.y).sum().item()
+                total += len(batch.y)
+                
+                # Periodic logging
+                if (batch_idx + 1) % 10 == 0:
+                    logger.info(f"Batch {batch_idx + 1}/{len(loader)}: Loss = {loss.item():.4f}")
+                
+            except Exception as e:
+                logger.error(f"Error in batch {batch_idx}: {str(e)}")
+                continue
+        
         return {
             'loss': total_loss / len(loader),
-            'accuracy': accuracy,
-            'outliers': outliers_detected
+            'accuracy': correct / total if total > 0 else 0
         }
-
-    @torch.no_grad()
-    def evaluate(self, loader, class_weights: torch.Tensor = None):
+    
+    def evaluate(self, loader, class_weights=None):
+        """Evaluate model with optional class weights."""
         self.model.eval()
         total_loss = 0
         correct = 0
         total = 0
-        outliers_detected = 0
-        predictions = []
-        true_labels = []
-        outlier_scores_list = []
+        all_preds = []
+        all_outlier_scores = []
         
-        for batch in loader:
-            batch = batch.to(self.device)
-            logits, outlier_scores = self.model(batch)
-            
-            # Calculate losses
-            if class_weights is not None:
-                loss = F.cross_entropy(logits, batch.y, weight=class_weights)
-            else:
-                loss = F.cross_entropy(logits, batch.y)
-            
-            # Track metrics
-            total_loss += loss.item()
-            pred = logits.argmax(dim=1)
-            correct += int((pred == batch.y).sum())
-            total += batch.y.size(0)
-            outliers_detected += int((outlier_scores < 0.5).sum())
-            
-            # Store predictions and scores
-            predictions.extend(pred.cpu().numpy())
-            true_labels.extend(batch.y.cpu().numpy())
-            outlier_scores_list.extend(outlier_scores.cpu().numpy())
+        criterion = nn.CrossEntropyLoss(weight=class_weights) if class_weights is not None else nn.CrossEntropyLoss()
         
-        accuracy = correct / total if total > 0 else 0
+        with torch.no_grad():
+            for batch in loader:
+                batch = batch.to(self.device)
+                
+                # Forward pass
+                output, outlier_scores = self.model(batch)
+                
+                # Compute loss
+                loss = criterion(output, batch.y)
+                
+                # Track metrics
+                total_loss += loss.item()
+                pred = output.argmax(dim=1)
+                correct += pred.eq(batch.y).sum().item()
+                total += len(batch.y)
+                
+                all_preds.extend(pred.cpu().numpy())
+                all_outlier_scores.extend(outlier_scores.cpu().numpy())
         
         return {
             'loss': total_loss / len(loader),
-            'accuracy': accuracy,
-            'outliers': outliers_detected,
-            'predictions': predictions,
-            'true_labels': true_labels,
-            'outlier_scores': outlier_scores_list
+            'accuracy': correct / total if total > 0 else 0,
+            'predictions': all_preds,
+            'outlier_scores': all_outlier_scores
         }
-
-def main():
-    # Setup
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
-    # Initialize data loader
-    data_loader = TemporalMalwareDataLoader(
-        batch_dir=Path('/data/saranyav/gcn_new/bodmas_batches'),
-        behavioral_groups_path=Path('/data/saranyav/gcn_new/behavioral_analysis/behavioral_groups.json'),
-        metadata_path=Path('bodmas_metadata_cleaned.csv'),
-        malware_types_path=Path('bodmas_malware_category.csv')
-    )
+# def main():
+#     # Setup
+#     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
-    # Get loaders
-    train_loader = data_loader.load_split('train', use_groups=True)
-    val_loader = data_loader.load_split('val', use_groups=True)
+#     # Initialize data loader
+#     data_loader = TemporalMalwareDataLoader(
+#         batch_dir=Path('/data/saranyav/gcn_new/bodmas_batches'),
+#         behavioral_groups_path=Path('/data/saranyav/gcn_new/behavioral_analysis/behavioral_groups.json'),
+#         metadata_path=Path('bodmas_metadata_cleaned.csv'),
+#         malware_types_path=Path('bodmas_malware_category.csv')
+#     )
     
-    # Initialize model
-    model = MalwareGNN(
-        num_node_features=14,
-        hidden_dim=128,
-        num_classes=18,
-        n_centroids_per_class=2
-    ).to(device)
+#     # Get loaders
+#     train_loader = data_loader.load_split('train', use_groups=True)
+#     val_loader = data_loader.load_split('val', use_groups=True)
     
-    # Initialize trainer
-    trainer = MalwareTrainer(model, device)
+#     # Initialize model
+#     model = MalwareGNN(
+#         num_node_features=14,
+#         hidden_dim=128,
+#         num_classes=18,
+#         n_centroids_per_class=2
+#     ).to(device)
     
-    # Compute class weights from training data
-    class_weights = trainer.compute_class_weights(train_loader)
+#     # Initialize trainer
+#     trainer = MalwareTrainer(model, device)
     
-    # Training loop
-    num_epochs = 100
-    best_val_acc = 0
+#     # Compute class weights from training data
+#     class_weights = trainer.compute_class_weights(train_loader)
     
-    for epoch in range(num_epochs):
-        # Train
-        train_metrics = trainer.train_epoch(train_loader, class_weights)
+#     # Training loop
+#     num_epochs = 100
+#     best_val_acc = 0
+    
+#     for epoch in range(num_epochs):
+#         # Train
+#         train_metrics = trainer.train_epoch(train_loader, class_weights)
         
-        # Evaluate
-        val_metrics = trainer.evaluate(val_loader, class_weights)
+#         # Evaluate
+#         val_metrics = trainer.evaluate(val_loader, class_weights)
         
-        # Log progress
-        logger.info(f"Epoch {epoch}:")
-        logger.info(f"Train Loss: {train_metrics['loss']:.4f}, Accuracy: {train_metrics['accuracy']:.4f}")
-        logger.info(f"Val Loss: {val_metrics['loss']:.4f}, Accuracy: {val_metrics['accuracy']:.4f}")
-        logger.info(f"Outliers detected: {val_metrics['outliers']}")
+#         # Log progress
+#         logger.info(f"Epoch {epoch}:")
+#         logger.info(f"Train Loss: {train_metrics['loss']:.4f}, Accuracy: {train_metrics['accuracy']:.4f}")
+#         logger.info(f"Val Loss: {val_metrics['loss']:.4f}, Accuracy: {val_metrics['accuracy']:.4f}")
+#         logger.info(f"Outliers detected: {val_metrics['outliers']}")
         
-        # Save best model
-        if val_metrics['accuracy'] > best_val_acc:
-            best_val_acc = val_metrics['accuracy']
-            torch.save(model.state_dict(), 'best_model.pt')
+#         # Save best model
+#         if val_metrics['accuracy'] > best_val_acc:
+#             best_val_acc = val_metrics['accuracy']
+#             torch.save(model.state_dict(), 'best_model.pt')
 
-if __name__ == "__main__":
-    main()
+# if __name__ == "__main__":
+#     main()
 
-sys.exit(0)
+# sys.exit(0)
 # class CentroidLayer(torch.nn.Module):
 #     def __init__(self, input_dim, n_classes, n_centroids_per_class=3):
 #         super().__init__()
@@ -375,7 +291,7 @@ sys.exit(0)
 #         return -min_distances
 
 
-def prepare_data(base_dir='bodmas_batches_test'):
+def prepare_data(base_dir='bodmas_batches_new'):
     """Prepare datasets with temporal ordering."""
     split_files = defaultdict(list)
     family_counts = defaultdict(int)
@@ -640,92 +556,243 @@ def evaluate(model, loader, device, family_to_idx, split='val'):
         logger.error(traceback.format_exc())
         return 0.0, {}
 
-def main():
-    # Setup
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    logger.info(f"Using device: {device}")
+# def main():
+#     # Setup
+#     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+#     logger.info(f"Using device: {device}")
     
-    # Prepare data with validation
-    split_files, num_classes, family_to_idx = prepare_data()
+#     # Prepare data with validation
+#     split_files, num_classes, family_to_idx = prepare_data()
     
-    # Validate feature dimensions
-    try:
-        first_batch = torch.load(split_files['train'][0])
-        num_features = first_batch[0].x.size(1)
-        logger.info(f"Number of node features: {num_features}")
-    except Exception as e:
-        logger.error(f"Error loading first batch: {e}")
-        return
+#     # Validate feature dimensions
+#     try:
+#         first_batch = torch.load(split_files['train'][0])
+#         num_features = first_batch[0].x.size(1)
+#         logger.info(f"Number of node features: {num_features}")
+#     except Exception as e:
+#         logger.error(f"Error loading first batch: {e}")
+#         return
     
-    # Initialize model
-    model = MalwareGNN(
-        num_node_features=num_features,
-        num_classes=num_classes
-    ).to(device)
+#     # Initialize model
+#     model = MalwareGNN(
+#         num_node_features=num_features,
+#         num_classes=num_classes
+#     ).to(device)
     
-    # Training settings
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=5e-4)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='max', factor=0.5, patience=5, verbose=True
-    )
-    num_epochs = 100
-    best_val_acc = 0
-    patience = 10
-    patience_counter = 0
+#     # Training settings
+#     optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=5e-4)
+#     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+#         optimizer, mode='max', factor=0.5, patience=5, verbose=True
+#     )
+#     num_epochs = 100
+#     best_val_acc = 0
+#     patience = 10
+#     patience_counter = 0
     
-    # Training loop
-    logger.info("\nStarting training...")
-    for epoch in range(num_epochs):
-        # Training
-        epoch_losses = []
-        for batch_file in split_files['train']:
-            train_loader = load_and_process_batch(batch_file, family_to_idx)
-            if train_loader:
-                loss = train_epoch(model, train_loader, optimizer, device)
-                epoch_losses.append(loss)
+#     # Training loop
+#     logger.info("\nStarting training...")
+#     for epoch in range(num_epochs):
+#         # Training
+#         epoch_losses = []
+#         for batch_file in split_files['train']:
+#             train_loader = load_and_process_batch(batch_file, family_to_idx)
+#             if train_loader:
+#                 loss = train_epoch(model, train_loader, optimizer, device)
+#                 epoch_losses.append(loss)
         
-        if not epoch_losses:
-            logger.warning(f"No valid training batches in epoch {epoch}")
-            continue
+#         if not epoch_losses:
+#             logger.warning(f"No valid training batches in epoch {epoch}")
+#             continue
             
-        avg_loss = sum(epoch_losses) / len(epoch_losses)
+#         avg_loss = sum(epoch_losses) / len(epoch_losses)
         
-        # Validation
-        val_accs = []
-        val_metrics = defaultdict(list)
-        for batch_file in split_files['val']:
-            val_loader = load_and_process_batch(batch_file, family_to_idx)
-            if val_loader:
-                acc, family_accs = evaluate(model, val_loader, device, family_to_idx, 'val')
-                val_accs.append(acc)
-                for family, acc in family_accs.items():
-                    val_metrics[family].append(acc)
+#         # Validation
+#         val_accs = []
+#         val_metrics = defaultdict(list)
+#         for batch_file in split_files['val']:
+#             val_loader = load_and_process_batch(batch_file, family_to_idx)
+#             if val_loader:
+#                 acc, family_accs = evaluate(model, val_loader, device, family_to_idx, 'val')
+#                 val_accs.append(acc)
+#                 for family, acc in family_accs.items():
+#                     val_metrics[family].append(acc)
         
-        if not val_accs:
-            logger.warning(f"No valid validation batches in epoch {epoch}")
-            continue
+#         if not val_accs:
+#             logger.warning(f"No valid validation batches in epoch {epoch}")
+#             continue
         
-        val_acc = sum(val_accs) / len(val_accs)
-        logger.info(f'Epoch {epoch:03d}, Loss: {avg_loss:.4f}, Val Acc: {val_acc:.4f}')
+#         val_acc = sum(val_accs) / len(val_accs)
+#         logger.info(f'Epoch {epoch:03d}, Loss: {avg_loss:.4f}, Val Acc: {val_acc:.4f}')
         
-        # Update learning rate
-        scheduler.step(val_acc)
+#         # Update learning rate
+#         scheduler.step(val_acc)
         
-        # Save best model and handle early stopping
-        if val_acc > best_val_acc:
-            best_val_acc = val_acc
-            torch.save({
-                'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'val_acc': val_acc,
-                'family_to_idx': family_to_idx
-            }, 'best_model.pt')
-            patience_counter = 0
-        else:
-            patience_counter += 1
-            if patience_counter >= patience:
-                logger.info
+#         # Save best model and handle early stopping
+#         if val_acc > best_val_acc:
+#             best_val_acc = val_acc
+#             torch.save({
+#                 'epoch': epoch,
+#                 'model_state_dict': model.state_dict(),
+#                 'optimizer_state_dict': optimizer.state_dict(),
+#                 'val_acc': val_acc,
+#                 'family_to_idx': family_to_idx
+#             }, 'best_model.pt')
+#             patience_counter = 0
+#         else:
+#             patience_counter += 1
+#             if patience_counter >= patience:
+#                 logger.info
 
-if __name__ == '__main__':
-    main()
+# if __name__ == '__main__':
+#     main()
+    
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch_geometric.nn import GCNConv, global_mean_pool
+from typing import Tuple
+
+class CentroidLayer(nn.Module):
+    def __init__(self, feature_dim: int, num_classes: int, n_centroids_per_class: int = 2):
+        super().__init__()
+        self.feature_dim = feature_dim
+        self.num_classes = num_classes
+        self.n_centroids = n_centroids_per_class
+        
+        # Ensure at least one class
+        if num_classes <= 0:
+            raise ValueError(f"Invalid number of classes: {num_classes}")
+        
+        logger.info(f"Initializing CentroidLayer with {num_classes} classes, {n_centroids_per_class} centroids per class")
+        
+        # Initialize centroids
+        self.centroids = nn.Parameter(
+            torch.randn(num_classes * n_centroids_per_class, feature_dim)
+        )
+        # Initialize with smaller values for better gradient flow
+        self.centroids.data = self.centroids.data * 0.1
+        
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Forward pass with robust distance computation.
+        Args:
+            x: Input tensor of shape (batch_size, feature_dim)
+        Returns:
+            Tuple of (class_distances, outlier_scores)
+        """
+        batch_size = x.size(0)
+        
+        # Compute pairwise distances between inputs and centroids
+        # Reshape x to (batch_size, 1, feature_dim)
+        x_expanded = x.unsqueeze(1)
+        # Reshape centroids to (1, num_total_centroids, feature_dim)
+        centroids_expanded = self.centroids.unsqueeze(0)
+        
+        # Compute distances (batch_size, num_total_centroids)
+        distances = torch.cdist(x_expanded, centroids_expanded).squeeze(1)
+        
+        # Initialize output tensors
+        class_distances = torch.zeros(batch_size, self.num_classes, device=x.device)
+        outlier_scores = torch.zeros(batch_size, device=x.device)
+        
+        # For each class, compute minimum distance to its centroids
+        for class_idx in range(self.num_classes):
+            start_idx = class_idx * self.n_centroids
+            end_idx = start_idx + self.n_centroids
+            
+            # Get minimum distance to any centroid of this class
+            class_min_distances = torch.min(distances[:, start_idx:end_idx], dim=1)[0]
+            class_distances[:, class_idx] = class_min_distances
+        
+        # Compute outlier scores as normalized distance to nearest centroid
+        min_distances = torch.min(class_distances, dim=1)[0]
+        if min_distances.numel() > 0:  # Check if tensor is non-empty
+            mean_min_dist = min_distances.mean()
+            std_min_dist = min_distances.std() if min_distances.numel() > 1 else torch.tensor(1.0)
+            outlier_scores = (min_distances - mean_min_dist) / (std_min_dist + 1e-6)
+        
+        return -class_distances, outlier_scores  # Negative distances for logits
+    
+    def _create_class_mask(self, num_classes: int, n_centroids: int) -> torch.Tensor:
+        """Create a mask for mapping centroids to classes."""
+        mask = torch.zeros(num_classes, num_classes * n_centroids)
+        for i in range(num_classes):
+            mask[i, i * n_centroids:(i + 1) * n_centroids] = 1.0
+        return mask
+
+class MalwareGNN(nn.Module):
+    def __init__(self, num_node_features: int, hidden_dim: int, num_classes: int,
+                 n_centroids_per_class: int = 2):
+        super().__init__()
+        
+        # Validate inputs
+        if num_classes <= 0:
+            raise ValueError(f"Invalid number of classes: {num_classes}")
+            
+        logger.info(f"Initializing MalwareGNN with {num_classes} classes")
+        
+        # Store dimensions
+        self.num_classes = num_classes
+        self.hidden_dim = hidden_dim
+        
+        # GNN layers
+        self.conv1 = GCNConv(num_node_features, hidden_dim)
+        self.conv2 = GCNConv(hidden_dim, hidden_dim)
+        self.conv3 = GCNConv(hidden_dim, hidden_dim)
+        
+        # Batch normalization
+        self.bn1 = nn.BatchNorm1d(hidden_dim)
+        self.bn2 = nn.BatchNorm1d(hidden_dim)
+        self.bn3 = nn.BatchNorm1d(hidden_dim)
+        
+        # Dropout for regularization
+        self.dropout = nn.Dropout(0.5)
+        
+        # Centroid layer for behavioral pattern detection
+        self.centroid = CentroidLayer(
+            feature_dim=hidden_dim,
+            num_classes=num_classes,
+            n_centroids_per_class=n_centroids_per_class
+        )
+
+    def forward(self, data):
+        try:
+            # Extract features and connectivity
+            x, edge_index = data.x, data.edge_index
+            batch = data.batch if hasattr(data, 'batch') else torch.zeros(x.size(0), dtype=torch.long, device=x.device)
+            
+            # Validate inputs
+            if x.size(0) == 0:
+                raise ValueError("Empty feature tensor")
+                
+            # First GCN layer
+            x1 = self.conv1(x, edge_index)
+            x1 = self.bn1(x1)
+            x1 = F.relu(x1)
+            x1 = self.dropout(x1)
+            
+            # Second GCN layer with residual connection
+            x2 = self.conv2(x1, edge_index)
+            x2 = self.bn2(x2)
+            x2 = F.relu(x2)
+            x2 = self.dropout(x2)
+            x2 = x2 + x1  # Residual connection
+            
+            # Third GCN layer
+            x3 = self.conv3(x2, edge_index)
+            x3 = self.bn3(x3)
+            x3 = F.relu(x3)
+            x3 = x3 + x2  # Residual connection
+            
+            # Global pooling
+            x = global_mean_pool(x3, batch)
+            
+            # Centroid-based classification
+            logits, outlier_scores = self.centroid(x)
+            
+            return logits, outlier_scores
+            
+        except Exception as e:
+            logger.error(f"Error in forward pass: {str(e)}")
+            logger.error(f"Input shapes - x: {x.shape}, edge_index: {edge_index.shape}")
+            raise

@@ -128,7 +128,7 @@ class MalwareBehaviorAggregator:
             'in_degree', 'out_degree', 'is_conditional', 'has_jump', 'has_ret'
         ]
         
-        # Initialize aggregated features
+        # Initialize aggregated features with default values
         family_features = {
             'feature_histograms': defaultdict(list),
             'behavior_patterns': defaultdict(float),
@@ -138,75 +138,103 @@ class MalwareBehaviorAggregator:
         total_nodes = 0
         n_bins = 20  # Fixed number of bins for all histograms
         
-        for graph in pyg_graphs:
-            node_features = graph.x.numpy()
-            edge_index = graph.edge_index.t().numpy()
-            num_nodes = len(node_features)
-            total_nodes += num_nodes
-            
-            # 1. Efficient feature distributions using numpy operations
-            for feat_idx, feature in enumerate(feature_names):
-                values = node_features[:, feat_idx]
-                if len(values) > 0:
-                    hist, _ = np.histogram(values, bins=n_bins, range=(0, np.max(values) + 1e-6), density=True)
-                    family_features['feature_histograms'][feature].append(hist)
-            
-            # 2. Behavior patterns - look for significant combinations
-            # Pre-compute boolean masks for efficiency
-            has_ext_calls = node_features[:, feature_names.index('external_calls')] > 0
-            has_mem_write = node_features[:, feature_names.index('mem_writes')] > 0
-            has_mem_read = node_features[:, feature_names.index('mem_reads')] > 0
-            is_conditional = node_features[:, feature_names.index('is_conditional')] > 0
-            has_jump = node_features[:, feature_names.index('has_jump')] > 0
-            
-            # Update pattern counts efficiently using numpy
-            patterns = {
-                'ext_call': np.sum(has_ext_calls),
-                'mem_rw': np.sum(has_mem_read & has_mem_write),
-                'cond_jump': np.sum(is_conditional & has_jump),
-                'ext_write': np.sum(has_ext_calls & has_mem_write)
+        # Even if we have no graphs, return a valid minimal feature set
+        if not pyg_graphs:
+            print("Warning: No graphs for family, using default features")
+            return {
+                'feature_stats': {
+                    feature: {
+                        'histogram': np.zeros(n_bins).tolist(),
+                        'histogram_std': np.zeros(n_bins).tolist()
+                    }
+                    for feature in feature_names
+                },
+                'behavior_patterns': {
+                    'ext_call': 0.0,
+                    'mem_rw': 0.0,
+                    'cond_jump': 0.0,
+                    'ext_write': 0.0
+                },
+                'local_structures': {
+                    'branching_nodes': 0.0,
+                    'merge_nodes': 0.0,
+                    'terminal_nodes': 0.0,
+                    'isolated_nodes': 0.0,
+                    'dense_regions': 0.0
+                }
             }
-            
-            for pattern, count in patterns.items():
-                family_features['behavior_patterns'][pattern] += count / num_nodes
-            
-            # 3. Local structure analysis - focus on node neighborhood characteristics
-            if len(edge_index) > 0:  # Only compute if we have edges
-                in_degrees = np.bincount(edge_index[:, 1], minlength=num_nodes)
-                out_degrees = np.bincount(edge_index[:, 0], minlength=num_nodes)
+        
+        for graph in pyg_graphs:
+            try:
+                node_features = graph.x.numpy()
+                edge_index = graph.edge_index.t().numpy()
+                num_nodes = len(node_features)
+                total_nodes += num_nodes
                 
-                # Analyze local structures
-                structures = {
-                    'branching_nodes': np.sum(out_degrees > 1) / num_nodes,
-                    'merge_nodes': np.sum(in_degrees > 1) / num_nodes,
-                    'terminal_nodes': np.sum((out_degrees == 0) & (in_degrees > 0)) / num_nodes,
-                    'isolated_nodes': np.sum((in_degrees == 0) & (out_degrees == 0)) / num_nodes,
-                    'dense_regions': np.sum((in_degrees > 2) & (out_degrees > 2)) / num_nodes
+                # 1. Feature distributions using numpy operations
+                for feat_idx, feature in enumerate(feature_names):
+                    values = node_features[:, feat_idx]
+                    if len(values) > 0:
+                        hist, _ = np.histogram(values, bins=n_bins, range=(0, np.max(values) + 1e-6), density=True)
+                        family_features['feature_histograms'][feature].append(hist)
+                    else:
+                        # Add zero histogram if no values
+                        family_features['feature_histograms'][feature].append(np.zeros(n_bins))
+                
+                # 2. Behavior patterns with safety checks
+                has_ext_calls = node_features[:, feature_names.index('external_calls')] > 0
+                has_mem_write = node_features[:, feature_names.index('mem_writes')] > 0
+                has_mem_read = node_features[:, feature_names.index('mem_reads')] > 0
+                is_conditional = node_features[:, feature_names.index('is_conditional')] > 0
+                has_jump = node_features[:, feature_names.index('has_jump')] > 0
+                
+                patterns = {
+                    'ext_call': np.sum(has_ext_calls),
+                    'mem_rw': np.sum(has_mem_read & has_mem_write),
+                    'cond_jump': np.sum(is_conditional & has_jump),
+                    'ext_write': np.sum(has_ext_calls & has_mem_write)
                 }
                 
-                for struct, ratio in structures.items():
-                    family_features['local_structures'][struct] += ratio
+                for pattern, count in patterns.items():
+                    family_features['behavior_patterns'][pattern] += count / max(num_nodes, 1)
+                
+                # 3. Local structure analysis with safety checks
+                if len(edge_index) > 0:
+                    in_degrees = np.bincount(edge_index[:, 1], minlength=num_nodes)
+                    out_degrees = np.bincount(edge_index[:, 0], minlength=num_nodes)
+                    
+                    structures = {
+                        'branching_nodes': np.sum(out_degrees > 1),
+                        'merge_nodes': np.sum(in_degrees > 1),
+                        'terminal_nodes': np.sum((out_degrees == 0) & (in_degrees > 0)),
+                        'isolated_nodes': np.sum((in_degrees == 0) & (out_degrees == 0)),
+                        'dense_regions': np.sum((in_degrees > 2) & (out_degrees > 2))
+                    }
+                    
+                    for struct, count in structures.items():
+                        family_features['local_structures'][struct] += count / max(num_nodes, 1)
+                
+            except Exception as e:
+                print(f"Warning: Error processing graph: {str(e)}")
+                continue
         
         num_graphs = len(pyg_graphs)
-        if num_graphs == 0:
-            return None
-            
-        # Finalize features
+        
+        # Always return a valid feature set
         return {
             'feature_stats': {
                 feature: {
-                    'histogram': np.mean(np.array(hists), axis=0).tolist(),
-                    'histogram_std': np.std(np.array(hists), axis=0).tolist()
+                    'histogram': np.mean(np.array(hists), axis=0).tolist() if hists else np.zeros(n_bins).tolist(),
+                    'histogram_std': np.std(np.array(hists), axis=0).tolist() if hists else np.zeros(n_bins).tolist()
                 }
                 for feature, hists in family_features['feature_histograms'].items()
-                if hists  # Only include features that have histograms
             },
             'behavior_patterns': {
-                pattern: count / num_graphs
+                pattern: count / max(num_graphs, 1)
                 for pattern, count in family_features['behavior_patterns'].items()
             },
             'local_structures': {
-                struct: count / num_graphs
+                struct: count / max(num_graphs, 1)
                 for struct, count in family_features['local_structures'].items()
             }
         }
@@ -454,100 +482,95 @@ class MalwareBehaviorAggregator:
             logger.info(f"Successfully processed {len(self.family_distributions)} families")
 
     def create_behavioral_groups(self, similarity_threshold: Optional[float] = None):
-        """Create behavioral groups constrained by malware types, with special handling for benign samples."""
+        """Create behavioral groups constrained by malware types, with special handling for outliers."""
         if not self.family_distributions:
             raise ValueError("No family distributions available. Run process_families first.")
                 
         similarity_computer = BehavioralSimilarityComputer(self.family_distributions)
         
-        # Separate benign and malware families
+        # Get all families and their malware types
         families = list(self.family_distributions.keys())
-        malware_families = [f for f in families if f != 'benign']
-        n_families = len(malware_families)
+        family_types = {f: self.malware_types.get(f, 'unknown') for f in families}
         
-        # Handle benign families separately
-        benign_families = [f for f in families if f == 'benign']
-        if benign_families:
-            logger.info(f"\nFound {len(benign_families)} benign families - will be grouped together")
+        # Group families by malware type first
+        type_groups = defaultdict(list)
+        for family in families:
+            mtype = family_types[family]
+            type_groups[mtype].append(family)
         
-        # Compute similarity matrix for malware families
-        similarity_matrix = np.zeros((n_families, n_families))
+        print(f"\nFound {len(type_groups)} malware types")
+        for mtype, type_families in type_groups.items():
+            print(f"{mtype}: {len(type_families)} families")
         
-        logger.info("Computing family similarities...")
-        for i, fam1 in enumerate(tqdm(malware_families)):
-            for j, fam2 in enumerate(malware_families):
-                # If malware types are different, set similarity to 0
-                if self.malware_types[fam1] != self.malware_types[fam2]:
-                    similarity_matrix[i,j] = 0
-                else:
-                    similarity_matrix[i,j] = similarity_computer.compute_similarity(
-                        self.family_distributions[fam1],
-                        self.family_distributions[fam2]
-                    )
-        
-        # Handle any NaN values
-        similarity_matrix = np.nan_to_num(similarity_matrix, nan=0.0)
-        
-        # Convert similarity to distance
-        distance_matrix = 1 - similarity_matrix
-        
-        # Find optimal clustering
-        labels, sil_score = self._find_optimal_clusters(distance_matrix, malware_families)
-        logger.info(f"Final Silhouette Score: {sil_score:.3f}")
-        
-        # Create groups - start with benign group
+        # Initialize behavioral groups
         behavioral_groups = defaultdict(list)
-        if benign_families:
-            behavioral_groups[0] = benign_families
-            # Adjust other labels to start from 1
-            labels = [l + 1 for l in labels]
+        next_group_id = 0
         
-        # Add malware groups
-        for family, label in zip(malware_families, labels):
-            behavioral_groups[label].append(family)
-        
-        # Log grouping results
-        logger.info(f"\nFound {len(behavioral_groups)} behavioral groups:")
-        
-        # Log benign group first if it exists
-        if benign_families:
-            logger.info(f"\nGroup 0 (Benign): {len(benign_families)} families")
-            if len(benign_families) > 10:
-                logger.info(f"Sample families: {', '.join(benign_families[:10])}...")
-            else:
-                logger.info(f"Families: {', '.join(benign_families)}")
-        
-        # Log malware groups
-        for group_id, group_families in behavioral_groups.items():
-            if group_id == 0:  # Skip benign group as it's already logged
-                continue
-            logger.info(f"\nGroup {group_id}: {len(group_families)} families")
-            mtype = self.malware_types[group_families[0]]  # All families in group should have same type
-            logger.info(f"Malware type: {mtype}")
+        # Process each malware type separately
+        for mtype, type_families in type_groups.items():
+            print(f"\nProcessing malware type: {mtype}")
+            n_families = len(type_families)
             
-            if len(group_families) > 10:
-                logger.info(f"Sample families: {', '.join(group_families[:10])}...")
-            else:
-                logger.info(f"Families: {', '.join(group_families)}")
+            if n_families == 0:
+                continue
+            elif n_families == 1:
+                # Single family gets its own group
+                behavioral_groups[next_group_id] = type_families
+                next_group_id += 1
+                continue
+            
+            # Compute similarity matrix for this type
+            similarity_matrix = np.zeros((n_families, n_families))
+            for i, fam1 in enumerate(type_families):
+                for j, fam2 in enumerate(type_families):
+                    if i != j:
+                        similarity_matrix[i,j] = similarity_computer.compute_similarity(
+                            self.family_distributions[fam1],
+                            self.family_distributions[fam2]
+                        )
+            
+            # Handle any NaN values
+            similarity_matrix = np.nan_to_num(similarity_matrix, nan=0.0)
+            
+            # Convert similarity to distance
+            distance_matrix = 1 - similarity_matrix
+            
+            # Cluster families of this type
+            from sklearn.cluster import AgglomerativeClustering
+            
+            # Use fewer clusters for small groups
+            n_clusters = max(1, min(int(n_families/3), 5))
+            clustering = AgglomerativeClustering(
+                n_clusters=n_clusters,
+                metric='precomputed',
+                linkage='average'
+            )
+            
+            labels = clustering.fit_predict(distance_matrix)
+            
+            # Assign families to behavioral groups
+            for family, label in zip(type_families, labels):
+                behavioral_groups[next_group_id + label].append(family)
+            
+            next_group_id += n_clusters
         
-
         # Verify all families are assigned
         all_families = set(self.family_distributions.keys())
         assigned_families = set(family for group in behavioral_groups.values() for family in group)
-        missing_families = all_families - assigned_families
-
-        if missing_families:
-            logger.warning(f"Found {len(missing_families)} unassigned families - assigning them to new groups")
-            
-            # Assign each missing family to its own new group
-            max_group = max(behavioral_groups.keys()) if behavioral_groups else -1
-            for i, family in enumerate(missing_families):
-                behavioral_groups[max_group + i + 1] = [family]
-
-        # Log final counts to verify
-        total_families = len(all_families)
-        total_assigned = sum(len(families) for families in behavioral_groups.values())
-        logger.info(f"Total families: {total_families}, Total assigned: {total_assigned}")
+        unassigned_families = all_families - assigned_families
+        
+        if unassigned_families:
+            print(f"\nAssigning {len(unassigned_families)} unassigned families to new groups")
+            for family in unassigned_families:
+                behavioral_groups[next_group_id] = [family]
+                next_group_id += 1
+        
+        # Log final grouping results
+        print(f"\nCreated {len(behavioral_groups)} behavioral groups:")
+        for group_id, group_families in behavioral_groups.items():
+            print(f"\nGroup {group_id}: {len(group_families)} families")
+            print(f"Sample families: {', '.join(group_families[:5])}...")
+        
         return behavioral_groups, similarity_matrix
                     
     def _find_optimal_clusters(self, distance_matrix: np.ndarray, malware_families: list) -> tuple:
@@ -610,7 +633,7 @@ class MalwareBehaviorAggregator:
 def main():
     # Initialize processor
     aggregator = MalwareBehaviorAggregator(
-        batch_dir=Path('bodmas_batches')
+        batch_dir=Path('bodmas_batches_new')
     )
     
     # Load processed data
