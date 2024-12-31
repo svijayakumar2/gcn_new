@@ -10,13 +10,114 @@ from datetime import datetime
 from torch_geometric.data import DataLoader
 from sklearn.metrics import classification_report
 import numpy as np
-from architectures import CentroidLayer, MalwareGNN
+# from architectures import CentroidLayer, MalwareGNN
 
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+import torch
+import numpy
+import os
+import numpy as np
+from torch_geometric.data import Data
+from torch_geometric.loader import DataLoader
+import collections
+from torch.nn import Linear
+import torch.nn.functional as F
+from torch_geometric.nn import GCNConv
+from torch_geometric.nn import global_mean_pool
+
+
+class CentroidLayer(torch.nn.Module):
+  def __init__(self, input_dim, n_classes, n_centroids_per_class=None, ac_std_lim=5.0, reject_input=False, **kwargs):
+
+    super().__init__(**kwargs)
+
+    self.n_classes = n_classes
+    self.n = n_centroids_per_class or 1
+    self.input_dim = int(input_dim)
+    
+    self.centroids = torch.nn.Parameter(torch.randn(self.n_classes, self.n, self.input_dim))
+    self.std_scale = torch.nn.Parameter(torch.tensor(1.0))
+    self.ac_temp = torch.nn.Parameter(torch.tensor(1.0))
+
+    running_mean = torch.tensor(torch.tensor(1.0))
+    running_var = torch.tensor(torch.tensor(0.0))
+    ac_std_lim = torch.tensor(torch.tensor(ac_std_lim))
+    
+    self.register_buffer('running_mean', running_mean)
+    self.register_buffer('running_var', running_var)
+    self.register_buffer('ac_std_lim', ac_std_lim)
+
+    self.reject_input = reject_input
+    self.relu = torch.nn.ReLU()
+  
+  def forward(self, x):
+
+      # This has shape (batch_size, n_classes, centroids_per_class)
+      # Note: the [None] notation adds an extra dimension that we can
+      #    broadcast over.
+
+      dist_to_centroids = torch.sqrt(
+          torch.sum((self.centroids[None] - x[:, None, None])**2,
+                        dim=-1))
+
+      # This is the min distance to class centroids and has shape (batch_size, n_classes).
+      dist, _ = torch.min(dist_to_centroids, dim=2)
+      y = -dist
+
+      if self.reject_input:
+
+        if self.training:
+          mean_dist = torch.mean(torch.min(dist, dim=1)[0]).detach()
+          var_dist = torch.var(torch.min(dist, dim=1)[0]).detach()
+          self.running_mean = self.running_mean * 0.9 + mean_dist * 0.1
+          self.running_var = self.running_var * 0.9 + var_dist * 0.1
+
+        max_ac_dist = self.running_mean + torch.clip(self.relu(self.std_scale), min=0., max=self.ac_std_lim) * torch.sqrt(self.running_var)
+
+        # we accept if the distance is smaller than the max_ac_dist
+        # that is, if max_ac_dist - dist > 0, accept(x) = 1
+        accept_score = max_ac_dist - torch.min(dist, dim=1, keepdims=True)[0].detach()
+        soft_accept_score = accept_score / self.ac_temp
+        soft_accept_score = soft_accept_score.sigmoid()
+
+
+        return torch.cat([y, soft_accept_score], dim=1)
+
+      return y
+
+
+class GCN(torch.nn.Module):
+    def __init__(self, hidden_channels):
+        super(GCN, self).__init__()
+        torch.manual_seed(12345)
+        self.centroid = CentroidLayer(100, 2, 2, reject_input=False)
+        self.conv1 = GCNConv(10, hidden_channels)
+        self.conv2 = GCNConv(hidden_channels, hidden_channels)
+        self.conv3 = GCNConv(hidden_channels, hidden_channels)
+        self.lin = Linear(hidden_channels, 2)
+
+    def forward(self, x, edge_index, batch):
+        # 1. Obtain node embeddings 
+        x = self.conv1(x, edge_index)
+        x = x.relu()
+        x = self.conv2(x, edge_index)
+        x = x.relu()
+        x = self.conv3(x, edge_index)
+
+        # 2. Readout layer
+        x = global_mean_pool(x, batch)  # [batch_size, hidden_channels]
+
+        # 3. Apply a final classifier
+        x = F.dropout(x, p=0.5, training=self.training)
+        x = self.lin(x)
+        
+        return x
+
 
 # class CentroidLayer(torch.nn.Module):
 #     def __init__(self, input_dim, n_classes, n_centroids_per_class=3):
