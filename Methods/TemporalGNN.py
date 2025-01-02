@@ -13,7 +13,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.nn import GCNConv, global_mean_pool
 
-
+CONFIDENCE_THRESHOLD = .8
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
@@ -182,7 +182,7 @@ class TemporalMalwareDataLoader:
     def get_num_classes(self, use_groups: bool = False) -> int:
         """Get the current number of classes."""
         if use_groups:
-            return self.num_known_groups + 1  # +1 for novel group
+            return self.num_known_groups #+ 1  # +1 for novel group
         else:
             return len(self.family_to_idx)  # Includes both known and novel families
         
@@ -261,8 +261,8 @@ class TemporalMalwareDataLoader:
         return merged_df
         
     def load_split(self, split: str = 'train', batch_size: int = 32, 
-                  use_groups: bool = False) -> DataLoader:
-        """Load a data split maintaining temporal order."""
+                use_groups: bool = False) -> Tuple[DataLoader, Dict]:
+        """Load a data split maintaining temporal order and return statistics."""
         split_dir = self.batch_dir / split
         batch_files = sorted(list(split_dir.glob('batch_*.pt')))
         
@@ -270,6 +270,16 @@ class TemporalMalwareDataLoader:
         
         all_graphs = []
         skipped = 0
+        
+        # Track statistics
+        split_stats = {
+            'known_families': defaultdict(int),
+            'novel_families': defaultdict(int),
+            'known_groups': defaultdict(int),
+            'novel_groups': defaultdict(int),
+            'total_samples': 0,
+            'novel_samples': 0
+        }
         
         for batch_file in batch_files:
             try:
@@ -280,6 +290,18 @@ class TemporalMalwareDataLoader:
                     processed = self._process_graph(graph, use_groups)
                     if processed is not None:
                         all_graphs.append(processed)
+                        
+                        # Update statistics
+                        split_stats['total_samples'] += 1
+                        family = graph.family.lower() if hasattr(graph, 'family') else 'unknown'
+                        
+                        if family in self.family_to_group:
+                            split_stats['known_families'][family] += 1
+                            split_stats['known_groups'][self.family_to_group[family]] += 1
+                        else:
+                            split_stats['novel_families'][family] += 1
+                            split_stats['novel_samples'] += 1
+                            split_stats['novel_groups'][self.NOVEL_GROUP_ID] += 1
                     else:
                         skipped += 1
                         
@@ -290,13 +312,18 @@ class TemporalMalwareDataLoader:
         # Sort by timestamp
         all_graphs.sort(key=lambda x: x.timestamp)
         
-        logger.info(f"Loaded {len(all_graphs)} graphs from {split} split "
-                   f"({skipped} skipped)")
+        # Log split statistics
+        logger.info(f"\nSplit statistics for {split}:")
+        logger.info(f"Total samples: {split_stats['total_samples']}")
+        logger.info(f"Novel samples: {split_stats['novel_samples']} "
+                f"({split_stats['novel_samples']/split_stats['total_samples']*100:.2f}%)")
+        logger.info(f"Known families: {len(split_stats['known_families'])}")
+        logger.info(f"Novel families: {len(split_stats['novel_families'])}")
         
         # Create loader
-        loader = DataLoader(all_graphs, batch_size=batch_size, shuffle=False)
-        return loader
-        
+        loader = DataLoader(all_graphs, batch_size=batch_size, shuffle=(split == 'train'))
+        return loader, split_stats
+
     def get_statistics(self) -> Dict:
         """Get dataset statistics."""
         stats = {
@@ -342,16 +369,93 @@ def analyze_behavioral_evolution(family_preds, group_preds, family_outliers, gro
                        f"Novelty Scores: {behavior['family_outlier_score']:.3f}, "
                        f"{behavior['group_outlier_score']:.3f}")
 
-def main():
-    print("="*50)
-    print("Starting main function")
-    print("="*50)
+def evaluate_novel_detection(trainer, loader, class_weights) -> Dict:
+    """Evaluate model's performance on novel family detection."""
+    trainer.model.eval()
     
+    novel_detection_metrics = {
+        'novel': {'tp': 0, 'fp': 0, 'fn': 0, 'tn': 0},
+        'per_family': defaultdict(lambda: {'tp': 0, 'fp': 0, 'fn': 0, 'tn': 0})
+    }
+    
+    with torch.no_grad():
+        for batch in loader:
+            batch = batch.to(trainer.device)
+            
+            # Get model predictions and outlier scores
+            logits, outlier_scores = trainer.model(batch)
+            confidences = F.softmax(logits, dim=1).max(dim=1)[0]
+            preds = logits.argmax(dim=1)
+            
+            # Novel detection using both outlier scores and confidence
+            confidence_threshold = 0.8  # Can be tuned
+            outlier_threshold = 0.7     # Can be tuned
+            
+            # A sample is considered novel if either:
+            # 1. It has high outlier score OR
+            # 2. It has low confidence in its prediction
+            pred_novel = (outlier_scores > outlier_threshold) | (confidences < confidence_threshold)
+            
+            # Update counters for novel detection
+            for pred, is_novel in zip(pred_novel, batch.is_novel):
+                pred = pred.item()
+                true_novel = is_novel.item()
+                
+                # Update global novel detection metrics
+                if true_novel and pred:
+                    novel_detection_metrics['novel']['tp'] += 1
+                elif true_novel and not pred:
+                    novel_detection_metrics['novel']['fn'] += 1
+                elif not true_novel and pred:
+                    novel_detection_metrics['novel']['fp'] += 1
+                else:
+                    novel_detection_metrics['novel']['tn'] += 1
+                
+                # Update per-family metrics
+                family = batch.family[0] if hasattr(batch, 'family') else 'unknown'
+                if isinstance(family, str):
+                    family = family.lower()
+                
+                if true_novel and pred:
+                    novel_detection_metrics['per_family'][family]['tp'] += 1
+                elif true_novel and not pred:
+                    novel_detection_metrics['per_family'][family]['fn'] += 1
+                elif not true_novel and pred:
+                    novel_detection_metrics['per_family'][family]['fp'] += 1
+                else:
+                    novel_detection_metrics['per_family'][family]['tn'] += 1
+    
+    # Calculate metrics
+    def calculate_metrics(stats):
+        tp, fp, fn, tn = stats['tp'], stats['fp'], stats['fn'], stats['tn']
+        precision = tp / (tp + fp) if (tp + fp) > 0 else 0
+        recall = tp / (tp + fn) if (tp + fn) > 0 else 0
+        f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
+        accuracy = (tp + tn) / (tp + tn + fp + fn) if (tp + tn + fp + fn) > 0 else 0
+        return {
+            'precision': precision,
+            'recall': recall,
+            'f1': f1,
+            'accuracy': accuracy,
+            'raw_counts': {'tp': tp, 'fp': fp, 'fn': fn, 'tn': tn}
+        }
+    
+    # Calculate overall metrics
+    metrics = {
+        'overall': calculate_metrics(novel_detection_metrics['novel']),
+        'per_family': {
+            family: calculate_metrics(stats) 
+            for family, stats in novel_detection_metrics['per_family'].items()
+        }
+    }
+    
+    return metrics
+
+def main():
     # Setup
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Using device: {device}")
     
-    print("Initializing data loader...")
+    # Initialize data loader
     data_loader = TemporalMalwareDataLoader(
         batch_dir=Path('/data/saranyav/gcn_new/bodmas_batches_new'),
         behavioral_groups_path=Path('/data/saranyav/gcn_new/behavioral_analysis/behavioral_groups.json'),
@@ -359,27 +463,20 @@ def main():
         malware_types_path=Path('bodmas_malware_category.csv')
     )
     
-    # Load data first to determine number of classes
-    print("Loading training data...")
-    train_loader_family = data_loader.load_split('train', use_groups=False, batch_size=32)
-    train_loader_groups = data_loader.load_split('train', use_groups=True, batch_size=32)
+    # Load data
+    train_loader_family, train_stats = data_loader.load_split('train', use_groups=False, batch_size=32)
+    train_loader_groups, train_group_stats = data_loader.load_split('train', use_groups=True, batch_size=32)
+    val_loader_family, val_stats = data_loader.load_split('val', use_groups=False, batch_size=32)
+    val_loader_groups, val_group_stats = data_loader.load_split('val', use_groups=True, batch_size=32)
     
-    print("Loading validation data...")
-    val_loader_family = data_loader.load_split('val', use_groups=False, batch_size=32)
-    val_loader_groups = data_loader.load_split('val', use_groups=True, batch_size=32)
-    
-    # Get number of classes after loading data
+    # Get number of classes
     num_family_classes = data_loader.get_num_classes(use_groups=False)
     num_group_classes = data_loader.get_num_classes(use_groups=True)
-    
-    logger.info(f"Total number of family classes (including novel): {num_family_classes}")
-    logger.info(f"Total number of behavioral groups (including novel): {num_group_classes}")
     
     if num_family_classes == 0 or num_group_classes == 0:
         raise ValueError("No classes found in the dataset")
     
-    # Now initialize models with correct number of classes
-    print("Initializing models...")
+    # Initialize models
     family_model = MalwareGNN(
         num_node_features=14,
         hidden_dim=128,
@@ -398,7 +495,7 @@ def main():
     family_trainer = MalwareTrainer(family_model, device)
     group_trainer = MalwareTrainer(group_model, device)
     
-    # Compute class weights after data is loaded
+    # Compute class weights
     family_weights = family_trainer.compute_class_weights(train_loader_family)
     group_weights = group_trainer.compute_class_weights(train_loader_groups)
     
@@ -407,101 +504,158 @@ def main():
     
     # Training parameters
     num_epochs = 100
+    early_stopping_patience = 5
+    best_family_f1 = 0
     best_family_acc = 0
+    best_group_f1 = 0
     best_group_acc = 0
+    family_patience = 0
+    group_patience = 0
     
-    # Print key information before training
-    logger.info(f"Starting training with:")
-    logger.info(f"- Number of family classes: {num_family_classes}")
-    logger.info(f"- Number of group classes: {num_group_classes}")
-    logger.info(f"- Device: {device}")
-    logger.info(f"- Batch size: 32")
-    logger.info(f"- Number of epochs: {num_epochs}")
+    # Metrics history
+    family_metrics_history = []
+    group_metrics_history = []
     
     # Training loop
     for epoch in range(num_epochs):
-        logger.info(f"\nEpoch {epoch + 1}/{num_epochs}")
-        
-        # Train family classification
-        logger.info("Training family classification...")
-        logger.info("Starting family classification training...")
-        family_metrics = train_and_evaluate(
-            trainer=family_trainer,
-            train_loader=train_loader_family,
-            val_loader=val_loader_family,
-            class_weights=family_weights,
-            model_name='family', num_epochs=num_epochs
-        )
-        
-        logger.info("\nStarting behavioral group classification training...")
-        group_metrics = train_and_evaluate(
-            trainer=group_trainer,
-            train_loader=train_loader_groups,
-            val_loader=val_loader_groups,
-            class_weights=group_weights,
-            model_name='group'
-        )
-        
-        # Final analysis
-        logger.info("\nAnalyzing behavioral evolution...")
-        evolution_metrics = data_loader.analyze_behavioral_evolution()
-        
-        # Combine all metrics for final report
-        final_report = {
-            'family_classification': family_metrics[-1],  # Last epoch metrics
-            'group_classification': group_metrics[-1],    # Last epoch metrics
-            'evolution_metrics': evolution_metrics
-        }
-        
-        # Save final report
-        with open('final_analysis_report.json', 'w') as f:
-            json.dump(final_report, f, indent=2, cls=NumpyEncoder)
-        
-        logger.info("\nTraining completed. Final report saved.")
+        # Train and evaluate family model
         family_train_metrics = family_trainer.train_epoch(train_loader_family, family_weights)
         family_val_metrics = family_trainer.evaluate(val_loader_family, family_weights)
+        family_novel_metrics = evaluate_novel_detection(family_trainer, val_loader_family, family_weights)
         
-        # Train behavioral group classification
-        logger.info("Training behavioral group classification...")
-        # group_train_metrics = group_trainer.train_epoch(train_loader_groups, group_weights)
-        # group_val_metrics = group_trainer.evaluate(val_loader_groups, group_weights)
+        # Train and evaluate group model
+        group_train_metrics = group_trainer.train_epoch(train_loader_groups, group_weights)
+        group_val_metrics = group_trainer.evaluate(val_loader_groups, group_weights)
+        group_novel_metrics = evaluate_novel_detection(group_trainer, val_loader_groups, group_weights)
         
-        # # Log metrics
-        # logger.info(f"\nFamily Classification:")
-
-        # logger.info(f"Train - Loss: {family_train_metrics['loss']:.4f}, "
-        #            f"Accuracy: {family_train_metrics['accuracy']:.4f}")
-        # logger.info(f"Val - Loss: {family_val_metrics['loss']:.4f}, "
-        #            f"Accuracy: {family_val_metrics['accuracy']:.4f}")
+        # Save metrics history
+        family_metrics_history.append({
+            'epoch': epoch,
+            'train': family_train_metrics,
+            'val': family_val_metrics,
+            'novel_detection': family_novel_metrics
+        })
         
-        # logger.info(f"\nBehavioral Group Classification:")
-        # logger.info(f"Train - Loss: {group_train_metrics['loss']:.4f}, "
-        #            f"Accuracy: {group_train_metrics['accuracy']:.4f}")
-        # logger.info(f"Val - Loss: {group_val_metrics['loss']:.4f}, "
-        #            f"Accuracy: {group_val_metrics['accuracy']:.4f}")
+        group_metrics_history.append({
+            'epoch': epoch,
+            'train': group_train_metrics,
+            'val': group_val_metrics,
+            'novel_detection': group_novel_metrics
+        })
         
-        # # Save best models
-        # if family_val_metrics['accuracy'] > best_family_acc:
-        #     best_family_acc = family_val_metrics['accuracy']
-        #     torch.save(family_model.state_dict(), 'best_family_model.pt')
-            
-        # if group_val_metrics['accuracy'] > best_group_acc:
-        #     best_group_acc = group_val_metrics['accuracy']
-        #     torch.save(group_model.state_dict(), 'best_group_model.pt')
+        # Save metrics to file
+        with open('family_metrics.json', 'w') as f:
+            json.dump(family_metrics_history, f, indent=2, cls=NumpyEncoder)
+        with open('group_metrics.json', 'w') as f:
+            json.dump(group_metrics_history, f, indent=2, cls=NumpyEncoder)
+        
+        # Early stopping and model saving for family classification
+        current_family_f1 = family_val_metrics['overall']['f1']
+        current_family_acc = family_val_metrics['overall']['accuracy']
+        
+        if current_family_f1 > best_family_f1 or (current_family_f1 == best_family_f1 and current_family_acc > best_family_acc):
+            best_family_f1 = current_family_f1
+            best_family_acc = current_family_acc
+            family_patience = 0
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': family_model.state_dict(),
+                'optimizer_state_dict': family_trainer.optimizer.state_dict(),
+                'metrics': family_val_metrics,
+                'novel_metrics': family_novel_metrics
+            }, 'best_family_model.pt')
+        else:
+            family_patience += 1
+        
+        # Early stopping and model saving for group classification
+        current_group_f1 = group_val_metrics['overall']['f1']
+        current_group_acc = group_val_metrics['overall']['accuracy']
+        
+        if current_group_f1 > best_group_f1 or (current_group_f1 == best_group_f1 and current_group_acc > best_group_acc):
+            best_group_f1 = current_group_f1
+            best_group_acc = current_group_acc
+            group_patience = 0
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': group_model.state_dict(),
+                'optimizer_state_dict': group_trainer.optimizer.state_dict(),
+                'metrics': group_val_metrics,
+                'novel_metrics': group_novel_metrics
+            }, 'best_group_model.pt')
+        else:
+            group_patience += 1
+        
+        # Check early stopping
+        if family_patience >= early_stopping_patience and group_patience >= early_stopping_patience:
+            break
         
         # Analyze behavioral evolution every 5 epochs
         if epoch % 5 == 0:
             evolution_metrics = data_loader.analyze_behavioral_evolution()
-            logger.info("\nEvolutionary Analysis:")
-            logger.info(f"Novel families: {len(evolution_metrics['novel_families'])}")
-            
-            for family, drift in evolution_metrics['behavioral_drift'].items():
-                if drift['trend'] > 0.1:
-                    logger.info(f"Family {family} showing significant evolution:")
-                    logger.info(f"- Mean drift: {drift['mean_drift']:.3f}")
-                    logger.info(f"- Trend: {drift['trend']:.3f}")
+    
+    # Load test data and evaluate
+    test_loader_family, test_stats = data_loader.load_split('test', use_groups=False, batch_size=32)
+    test_loader_groups, test_group_stats = data_loader.load_split('test', use_groups=True, batch_size=32)
+    
+    # Load best models
+    family_checkpoint = torch.load('best_family_model.pt')
+    family_model.load_state_dict(family_checkpoint['model_state_dict'])
+    
+    group_checkpoint = torch.load('best_group_model.pt')
+    group_model.load_state_dict(group_checkpoint['model_state_dict'])
+    
+    # Final test evaluation
+    test_family_metrics = family_trainer.evaluate(test_loader_family, family_weights)
+    test_group_metrics = group_trainer.evaluate(test_loader_groups, group_weights)
+    test_family_novel = evaluate_novel_detection(family_trainer, test_loader_family, family_weights)
+    test_group_novel = evaluate_novel_detection(group_trainer, test_loader_groups, group_weights)
+    
+    # Save final report
+    final_report = {
+        'training_history': {
+            'family': family_metrics_history,
+            'group': group_metrics_history
+        },
+        'best_models': {
+            'family': {
+                'epoch': family_checkpoint['epoch'],
+                'metrics': family_checkpoint['metrics'],
+                'novel_metrics': family_checkpoint['novel_metrics']
+            },
+            'group': {
+                'epoch': group_checkpoint['epoch'],
+                'metrics': group_checkpoint['metrics'],
+                'novel_metrics': group_checkpoint['novel_metrics']
+            }
+        },
+        'test_results': {
+            'family': {
+                'metrics': test_family_metrics,
+                'novel_detection': test_family_novel
+            },
+            'group': {
+                'metrics': test_group_metrics,
+                'novel_detection': test_group_novel
+            }
+        },
+        'data_statistics': {
+            'train': {
+                'family': train_stats,
+                'group': train_group_stats
+            },
+            'val': {
+                'family': val_stats,
+                'group': val_group_stats
+            },
+            'test': {
+                'family': test_stats,
+                'group': test_group_stats
+            }
+        }
+    }
+    
+    with open('final_report.json', 'w') as f:
+        json.dump(final_report, f, indent=2, cls=NumpyEncoder)
 
 if __name__ == "__main__":
-    print("Script is starting...")
     main()
-    print("Script has finished.")
