@@ -20,6 +20,7 @@ from TemporalGNN import TemporalMalwareDataLoader
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+
 class BaselineGNN(torch.nn.Module):
     """Basic GNN without centroid layer for baseline comparison."""
     def __init__(self, num_node_features: int, hidden_dim: int, num_classes: int):
@@ -58,36 +59,44 @@ class BaselineAnalyzer:
         self.device = device
         self.results = defaultdict(dict)
         
+
     def extract_graph_features(self, loader) -> Tuple[np.ndarray, np.ndarray]:
         """Extract features from graphs for traditional ML methods."""
         features_list = []
         labels_list = []
         
         for batch in loader:
-            # Global graph features
-            num_nodes = batch.x.size(0)
-            num_edges = batch.edge_index.size(1)
-            avg_degree = num_edges / num_nodes
-            
-            # Node feature statistics
-            node_features = batch.x.numpy()
-            node_stats = np.concatenate([
-                np.mean(node_features, axis=0),
-                np.std(node_features, axis=0),
-                np.max(node_features, axis=0),
-                np.min(node_features, axis=0)
-            ])
-            
-            # Combine features
-            graph_features = np.concatenate([
-                [num_nodes, num_edges, avg_degree],
-                node_stats
-            ])
-            
-            features_list.append(graph_features)
-            labels_list.append(batch.y.item())
-            
+            batch_size = batch.y.size(0)
+            for i in range(batch_size):
+                # Global graph features for each graph in batch
+                start_idx = batch.ptr[i].item()
+                end_idx = batch.ptr[i + 1].item()
+                
+                num_nodes = end_idx - start_idx
+                num_edges = batch.edge_index[:, (batch.edge_index[0] >= start_idx) & 
+                                            (batch.edge_index[0] < end_idx)].size(1)
+                avg_degree = num_edges / num_nodes if num_nodes > 0 else 0
+                
+                # Node feature statistics for this graph
+                node_features = batch.x[start_idx:end_idx].numpy()
+                node_stats = np.concatenate([
+                    np.mean(node_features, axis=0),
+                    np.std(node_features, axis=0),
+                    np.max(node_features, axis=0),
+                    np.min(node_features, axis=0)
+                ])
+                
+                # Combine features
+                graph_features = np.concatenate([
+                    [num_nodes, num_edges, avg_degree],
+                    node_stats
+                ])
+                
+                features_list.append(graph_features)
+                labels_list.append(batch.y[i].item())
+        
         return np.array(features_list), np.array(labels_list)
+
     
     def evaluate_baseline_gnn(self, train_loader, val_loader, test_loader):
         """Evaluate baseline GNN model."""
@@ -267,7 +276,7 @@ class BaselineAnalyzer:
         """Compute overall F1 score."""
         metrics = self._compute_metrics(y_true, y_pred)
         return metrics['overall']['f1']
-    
+        
     def run_all_baselines(self):
         """Run all baseline evaluations."""
         # Load data
@@ -275,8 +284,34 @@ class BaselineAnalyzer:
         val_loader, _ = self.data_loader.load_split('val', batch_size=32)
         test_loader, _ = self.data_loader.load_split('test', batch_size=32)
         
-        # Run evaluations
-        self.evaluate_baseline_gnn(train_loader, val_loader, test_loader)
+        # Check if GNN model exists
+        if not Path('best_baseline_gnn.pt').exists():
+            self.evaluate_baseline_gnn(train_loader, val_loader, test_loader)
+        else:
+            logger.info("Loading existing GNN model...")
+            model = BaselineGNN(
+                num_node_features=14,
+                hidden_dim=128, 
+                num_classes=self.data_loader.get_num_classes()
+            ).to(self.device)
+            model.load_state_dict(torch.load('best_baseline_gnn.pt'))
+            
+            # Evaluate on test set
+            model.eval()
+            test_preds = []
+            test_labels = []
+            
+            with torch.no_grad():
+                for batch in test_loader:
+                    batch = batch.to(self.device)
+                    output = model(batch)
+                    preds = output.argmax(dim=1)
+                    test_preds.extend(preds.cpu().numpy())
+                    test_labels.extend(batch.y.cpu().numpy())
+            
+            self.results['baseline_gnn'] = self._compute_metrics(test_labels, test_preds)
+        
+        # Run traditional ML evaluation
         self.evaluate_traditional_ml(train_loader, val_loader, test_loader)
         
         # Save results
