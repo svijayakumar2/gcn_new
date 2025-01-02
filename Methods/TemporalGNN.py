@@ -23,6 +23,61 @@ logger = logging.getLogger(__name__)
 
 from gcn import CentroidLayer, MalwareGNN, MalwareTrainer
 
+# Helper class for JSON serialization
+class NumpyEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        if isinstance(obj, np.float32):
+            return float(obj)
+        return json.JSONEncoder.default(self, obj)
+    
+def train_and_evaluate(trainer, train_loader, val_loader, class_weights, 
+                      model_name, early_stopping_patience=5, num_epochs=100):
+    """Train and evaluate with detailed metrics tracking."""
+    best_f1 = 0
+    patience_counter = 0
+    metrics_history = []
+    
+    for epoch in range(num_epochs):
+        # Training
+        train_metrics = trainer.evaluate(train_loader, class_weights)
+        trainer.log_metrics(train_metrics, split="train")
+        
+        # Validation
+        val_metrics = trainer.evaluate(val_loader, class_weights)
+        trainer.log_metrics(val_metrics, split="val")
+        
+        # Save metrics history
+        metrics_history.append({
+            'epoch': epoch,
+            'train': train_metrics,
+            'val': val_metrics
+        })
+        
+        # Save metrics to file
+        with open(f'{model_name}_metrics.json', 'w') as f:
+            json.dump(metrics_history, f, indent=2, cls=NumpyEncoder)
+        
+        # Early stopping based on F1 score
+        current_f1 = val_metrics['overall']['f1']
+        if current_f1 > best_f1:
+            best_f1 = current_f1
+            patience_counter = 0
+            # Save best model
+            torch.save({
+                'model_state_dict': trainer.model.state_dict(),
+                'metrics': val_metrics,
+                'epoch': epoch
+            }, f'best_{model_name}_model.pt')
+            logger.info(f"New best model saved with F1: {best_f1:.4f}")
+        else:
+            patience_counter += 1
+            if patience_counter >= early_stopping_patience:
+                logger.info(f"Early stopping triggered after {epoch + 1} epochs")
+                break
+    
+    return metrics_history
 
 class TemporalMalwareDataLoader:
     def __init__(self, 
@@ -369,36 +424,70 @@ def main():
         
         # Train family classification
         logger.info("Training family classification...")
+        logger.info("Starting family classification training...")
+        family_metrics = train_and_evaluate(
+            trainer=family_trainer,
+            train_loader=train_loader_family,
+            val_loader=val_loader_family,
+            class_weights=family_weights,
+            model_name='family', num_epochs=num_epochs
+        )
+        
+        logger.info("\nStarting behavioral group classification training...")
+        group_metrics = train_and_evaluate(
+            trainer=group_trainer,
+            train_loader=train_loader_groups,
+            val_loader=val_loader_groups,
+            class_weights=group_weights,
+            model_name='group'
+        )
+        
+        # Final analysis
+        logger.info("\nAnalyzing behavioral evolution...")
+        evolution_metrics = data_loader.analyze_behavioral_evolution()
+        
+        # Combine all metrics for final report
+        final_report = {
+            'family_classification': family_metrics[-1],  # Last epoch metrics
+            'group_classification': group_metrics[-1],    # Last epoch metrics
+            'evolution_metrics': evolution_metrics
+        }
+        
+        # Save final report
+        with open('final_analysis_report.json', 'w') as f:
+            json.dump(final_report, f, indent=2, cls=NumpyEncoder)
+        
+        logger.info("\nTraining completed. Final report saved.")
         family_train_metrics = family_trainer.train_epoch(train_loader_family, family_weights)
         family_val_metrics = family_trainer.evaluate(val_loader_family, family_weights)
         
         # Train behavioral group classification
         logger.info("Training behavioral group classification...")
-        group_train_metrics = group_trainer.train_epoch(train_loader_groups, group_weights)
-        group_val_metrics = group_trainer.evaluate(val_loader_groups, group_weights)
+        # group_train_metrics = group_trainer.train_epoch(train_loader_groups, group_weights)
+        # group_val_metrics = group_trainer.evaluate(val_loader_groups, group_weights)
         
-        # Log metrics
-        logger.info(f"\nFamily Classification:")
+        # # Log metrics
+        # logger.info(f"\nFamily Classification:")
 
-        logger.info(f"Train - Loss: {family_train_metrics['loss']:.4f}, "
-                   f"Accuracy: {family_train_metrics['accuracy']:.4f}")
-        logger.info(f"Val - Loss: {family_val_metrics['loss']:.4f}, "
-                   f"Accuracy: {family_val_metrics['accuracy']:.4f}")
+        # logger.info(f"Train - Loss: {family_train_metrics['loss']:.4f}, "
+        #            f"Accuracy: {family_train_metrics['accuracy']:.4f}")
+        # logger.info(f"Val - Loss: {family_val_metrics['loss']:.4f}, "
+        #            f"Accuracy: {family_val_metrics['accuracy']:.4f}")
         
-        logger.info(f"\nBehavioral Group Classification:")
-        logger.info(f"Train - Loss: {group_train_metrics['loss']:.4f}, "
-                   f"Accuracy: {group_train_metrics['accuracy']:.4f}")
-        logger.info(f"Val - Loss: {group_val_metrics['loss']:.4f}, "
-                   f"Accuracy: {group_val_metrics['accuracy']:.4f}")
+        # logger.info(f"\nBehavioral Group Classification:")
+        # logger.info(f"Train - Loss: {group_train_metrics['loss']:.4f}, "
+        #            f"Accuracy: {group_train_metrics['accuracy']:.4f}")
+        # logger.info(f"Val - Loss: {group_val_metrics['loss']:.4f}, "
+        #            f"Accuracy: {group_val_metrics['accuracy']:.4f}")
         
-        # Save best models
-        if family_val_metrics['accuracy'] > best_family_acc:
-            best_family_acc = family_val_metrics['accuracy']
-            torch.save(family_model.state_dict(), 'best_family_model.pt')
+        # # Save best models
+        # if family_val_metrics['accuracy'] > best_family_acc:
+        #     best_family_acc = family_val_metrics['accuracy']
+        #     torch.save(family_model.state_dict(), 'best_family_model.pt')
             
-        if group_val_metrics['accuracy'] > best_group_acc:
-            best_group_acc = group_val_metrics['accuracy']
-            torch.save(group_model.state_dict(), 'best_group_model.pt')
+        # if group_val_metrics['accuracy'] > best_group_acc:
+        #     best_group_acc = group_val_metrics['accuracy']
+        #     torch.save(group_model.state_dict(), 'best_group_model.pt')
         
         # Analyze behavioral evolution every 5 epochs
         if epoch % 5 == 0:

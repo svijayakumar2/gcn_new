@@ -15,6 +15,8 @@ import sys
 import torch.nn as nn
 import torch.nn.functional as F
 # from architectures import CentroidLayer, MalwareGNN
+# confusion_matrix
+from sklearn.metrics import confusion_matrix
 
 logging.basicConfig(
     level=logging.INFO,
@@ -166,14 +168,12 @@ class MalwareTrainer:
             'loss': total_loss / len(loader),
             'accuracy': correct / total if total > 0 else 0
         }
-    
     def evaluate(self, loader, class_weights=None):
-        """Evaluate model with optional class weights."""
+        """Evaluate model with comprehensive metrics."""
         self.model.eval()
         total_loss = 0
-        correct = 0
-        total = 0
         all_preds = []
+        all_labels = []
         all_outlier_scores = []
         
         criterion = nn.CrossEntropyLoss(weight=class_weights) if class_weights is not None else nn.CrossEntropyLoss()
@@ -188,22 +188,99 @@ class MalwareTrainer:
                 # Compute loss
                 loss = criterion(output, batch.y)
                 
-                # Track metrics
-                total_loss += loss.item()
+                # Store predictions and labels
                 pred = output.argmax(dim=1)
-                correct += pred.eq(batch.y).sum().item()
-                total += len(batch.y)
+                all_preds.append(pred)
+                all_labels.append(batch.y)
+                all_outlier_scores.append(outlier_scores)
                 
-                all_preds.extend(pred.cpu().numpy())
-                all_outlier_scores.extend(outlier_scores.cpu().numpy())
+                total_loss += loss.item()
         
-        return {
-            'loss': total_loss / len(loader),
-            'accuracy': correct / total if total > 0 else 0,
-            'predictions': all_preds,
-            'outlier_scores': all_outlier_scores
+        # Concatenate all predictions and labels
+        all_preds = torch.cat(all_preds)
+        all_labels = torch.cat(all_labels)
+        all_outlier_scores = torch.cat(all_outlier_scores)
+        
+        # Compute comprehensive metrics
+        metrics = self.compute_metrics(all_labels, all_preds, self.model.num_classes)
+        
+        # Add loss and outlier scores to metrics
+        metrics['loss'] = total_loss / len(loader)
+        metrics['outlier_scores'] = all_outlier_scores.cpu().numpy()
+        
+        return metrics
+        
+    def log_metrics(self, metrics, split="val"):
+        """Log metrics in a structured format."""
+        logger.info(f"\n{split.capitalize()} Metrics:")
+        logger.info(f"Overall Performance:")
+        logger.info(f"- Loss: {metrics['loss']:.4f}")
+        logger.info(f"- Accuracy: {metrics['overall']['accuracy']:.4f}")
+        logger.info(f"- Precision: {metrics['overall']['precision']:.4f}")
+        logger.info(f"- Recall: {metrics['overall']['recall']:.4f}")
+        logger.info(f"- F1-Score: {metrics['overall']['f1']:.4f}")
+        
+        logger.info("\nPer-Class Performance:")
+        for class_idx, class_metrics in metrics['per_class'].items():
+            if class_metrics['support'] > 0:  # Only show classes with samples
+                logger.info(f"\nClass {class_idx}:")
+                logger.info(f"- Support: {class_metrics['support']}")
+                logger.info(f"- Precision: {class_metrics['precision']:.4f}")
+                logger.info(f"- Recall: {class_metrics['recall']:.4f}")
+                logger.info(f"- F1-Score: {class_metrics['f1']:.4f}")
+
+    def compute_metrics(self, y_true, y_pred, num_classes):
+        """
+        Compute detailed classification metrics.
+        Returns both per-class and overall metrics.
+        """
+        # Initialize metric containers
+        metrics = {
+            'per_class': {},
+            'overall': {}
         }
-    
+        
+        # Convert to numpy for sklearn metrics
+        y_true = y_true.cpu().numpy()
+        y_pred = y_pred.cpu().numpy()
+        
+        # Compute confusion matrix
+        conf_matrix = confusion_matrix(y_true, y_pred, labels=range(num_classes))
+        
+        # Per-class metrics
+        for class_idx in range(num_classes):
+            # True Positives, False Positives, False Negatives
+            tp = conf_matrix[class_idx, class_idx]
+            fp = conf_matrix[:, class_idx].sum() - tp
+            fn = conf_matrix[class_idx, :].sum() - tp
+            
+            # Handle division by zero
+            precision = tp / (tp + fp) if (tp + fp) > 0 else 0
+            recall = tp / (tp + fn) if (tp + fn) > 0 else 0
+            f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
+            
+            metrics['per_class'][class_idx] = {
+                'precision': precision,
+                'recall': recall,
+                'f1': f1,
+                'support': int(conf_matrix[class_idx, :].sum())
+            }
+        
+        # Overall metrics (weighted by support)
+        total_samples = conf_matrix.sum()
+        weighted_precision = sum(m['precision'] * m['support'] for m in metrics['per_class'].values()) / total_samples
+        weighted_recall = sum(m['recall'] * m['support'] for m in metrics['per_class'].values()) / total_samples
+        weighted_f1 = sum(m['f1'] * m['support'] for m in metrics['per_class'].values()) / total_samples
+        
+        metrics['overall'] = {
+            'precision': weighted_precision,
+            'recall': weighted_recall,
+            'f1': weighted_f1,
+            'accuracy': (y_true == y_pred).mean()
+        }
+        
+        return metrics
+        
 # def main():
 #     # Setup
 #     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
