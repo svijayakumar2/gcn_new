@@ -321,7 +321,15 @@ class TemporalMalwareDataLoader:
         logger.info(f"Novel families: {len(split_stats['novel_families'])}")
         
         # Create loader
-        loader = DataLoader(all_graphs, batch_size=batch_size, shuffle=(split == 'train'))
+        # In load_split method:
+        loader = DataLoader(
+            all_graphs, 
+            batch_size=batch_size, 
+            shuffle=(split == 'train'),
+            num_workers=4,  # Add parallel data loading
+            pin_memory=True  # Better GPU transfer
+        )
+
         return loader, split_stats
 
     def get_statistics(self) -> Dict:
@@ -450,9 +458,45 @@ def evaluate_novel_detection(trainer, loader, class_weights) -> Dict:
     }
     
     return metrics
+import os 
+import glob
+
+def cleanup_old_checkpoints(name, keep_last_n=5):
+    """Keep only the N most recent checkpoints."""
+    checkpoints = sorted(glob.glob(f'checkpoint_{name}_epoch_*.pt'))
+    if len(checkpoints) > keep_last_n:
+        for checkpoint in checkpoints[:-keep_last_n]:
+            os.remove(checkpoint)
+            logger.info(f"Removed old checkpoint: {checkpoint}")
+
+def save_checkpoint(epoch, model, optimizer, metrics, novel_metrics, name, is_best=False):
+    """Save training checkpoint and optionally mark as best model."""
+    checkpoint = {
+        'epoch': epoch,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'metrics': metrics,
+        'novel_metrics': novel_metrics
+    }
+    
+    # Save periodic checkpoint
+    torch.save(checkpoint, f'checkpoint_{name}_epoch_{epoch}.pt')
+    logger.info(f"Saved checkpoint at epoch {epoch}")
+    
+    # Optionally save as best model
+    if is_best:
+        torch.save(checkpoint, f'best_{name}_model.pt')
+        logger.info(f"Saved as best model")
+
 
 def main():
     # Setup
+    # Memory optimization config
+    torch.backends.cudnn.benchmark = True
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        # Set memory allocator config
+        os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
     # Initialize data loader
@@ -477,24 +521,38 @@ def main():
         raise ValueError("No classes found in the dataset")
     
     # Initialize models
+    # Initialize models with better parameters
     family_model = MalwareGNN(
         num_node_features=14,
-        hidden_dim=128,
+        hidden_dim=256,  # Increased from 128
         num_classes=num_family_classes,
-        n_centroids_per_class=2
+        n_centroids_per_class=4,  # Increased from 2
+        num_layers=4,  # New parameter
+        dropout=0.2  # New parameter
     ).to(device)
-    
+
     group_model = MalwareGNN(
         num_node_features=14,
-        hidden_dim=128,
+        hidden_dim=256,
         num_classes=num_group_classes,
-        n_centroids_per_class=2
+        n_centroids_per_class=4,
+        num_layers=4,
+        dropout=0.2
     ).to(device)
     
-    # Initialize trainers
-    family_trainer = MalwareTrainer(family_model, device)
-    group_trainer = MalwareTrainer(group_model, device)
-    
+    # Initialize trainers with better parameters
+    family_trainer = MalwareTrainer(
+        model=family_model, 
+        device=device,
+        lr=0.001,
+        weight_decay=1e-4
+    )
+    group_trainer = MalwareTrainer(
+        model=group_model, 
+        device=device,
+        lr=0.001,
+        weight_decay=1e-4
+    )
     # Compute class weights
     family_weights = family_trainer.compute_class_weights(train_loader_family)
     group_weights = group_trainer.compute_class_weights(train_loader_groups)
@@ -550,13 +608,13 @@ def main():
         with open('group_metrics.json', 'w') as f:
             json.dump(group_metrics_history, f, indent=2, cls=NumpyEncoder)
         
-        # Early stopping and model saving for family classification
+        # Early stopping based only on F1 score
         current_family_f1 = family_val_metrics['overall']['f1']
-        current_family_acc = family_val_metrics['overall']['accuracy']
+        current_group_f1 = group_val_metrics['overall']['f1']
         
-        if current_family_f1 > best_family_f1 or (current_family_f1 == best_family_f1 and current_family_acc > best_family_acc):
+        # Save best family model
+        if current_family_f1 > best_family_f1:
             best_family_f1 = current_family_f1
-            best_family_acc = current_family_acc
             family_patience = 0
             torch.save({
                 'epoch': epoch,
@@ -565,16 +623,13 @@ def main():
                 'metrics': family_val_metrics,
                 'novel_metrics': family_novel_metrics
             }, 'best_family_model.pt')
+            logger.info(f"New best family model saved with F1: {best_family_f1:.4f}")
         else:
             family_patience += 1
         
-        # Early stopping and model saving for group classification
-        current_group_f1 = group_val_metrics['overall']['f1']
-        current_group_acc = group_val_metrics['overall']['accuracy']
-        
-        if current_group_f1 > best_group_f1 or (current_group_f1 == best_group_f1 and current_group_acc > best_group_acc):
+        # Save best group model
+        if current_group_f1 > best_group_f1:
             best_group_f1 = current_group_f1
-            best_group_acc = current_group_acc
             group_patience = 0
             torch.save({
                 'epoch': epoch,
@@ -583,17 +638,78 @@ def main():
                 'metrics': group_val_metrics,
                 'novel_metrics': group_novel_metrics
             }, 'best_group_model.pt')
+            logger.info(f"New best group model saved with F1: {best_group_f1:.4f}")
         else:
             group_patience += 1
-        
-        # Check early stopping
+                
+        # Early stopping check
         if family_patience >= early_stopping_patience and group_patience >= early_stopping_patience:
-            break
-        
-        # Analyze behavioral evolution every 5 epochs
+            if epoch < 30:  # Minimum number of epochs
+                logger.info("Continuing training despite early stopping trigger")
+                family_patience = 0
+                group_patience = 0
+            else:
+                logger.info(f"Early stopping triggered after {epoch + 1} epochs")
+                break
+
+        # Compute optimal thresholds periodically
         if epoch % 5 == 0:
-            evolution_metrics = data_loader.analyze_behavioral_evolution()
-    
+            family_thresholds = family_trainer.compute_optimal_thresholds(val_loader_family)
+            group_thresholds = group_trainer.compute_optimal_thresholds(val_loader_groups)
+            family_trainer.best_thresholds = family_thresholds
+            group_trainer.best_thresholds = group_thresholds
+
+        if epoch % 10 == 0:
+            cleanup_old_checkpoints('family', keep_last_n=5)
+            cleanup_old_checkpoints('group', keep_last_n=5)
+            save_checkpoint(
+                epoch=epoch,
+                model=family_model,
+                optimizer=family_trainer.optimizer,
+                metrics=family_val_metrics,
+                novel_metrics=family_novel_metrics,
+                name='family'
+            )
+            save_checkpoint(
+                epoch=epoch,
+                model=group_model,
+                optimizer=group_trainer.optimizer,
+                metrics=group_val_metrics,
+                novel_metrics=group_novel_metrics,
+                name='group'
+            )
+        
+        # Save best models as before
+        if current_family_f1 > best_family_f1:
+            best_family_f1 = current_family_f1
+            family_patience = 0
+            save_checkpoint(
+                epoch=epoch,
+                model=family_model,
+                optimizer=family_trainer.optimizer,
+                metrics=family_val_metrics,
+                novel_metrics=family_novel_metrics,
+                name='family',
+                is_best=True
+            )
+        
+        # Similar for group model
+        if current_group_f1 > best_group_f1:
+            best_group_f1 = current_group_f1
+            group_patience = 0
+            save_checkpoint(
+                epoch=epoch,
+                model=group_model,
+                optimizer=group_trainer.optimizer,
+                metrics=group_val_metrics,
+                novel_metrics=group_novel_metrics,
+                name='group',
+                is_best=True
+            )
+        # Step the schedulers
+        family_trainer.scheduler.step(family_val_metrics['overall']['f1'])
+        group_trainer.scheduler.step(group_val_metrics['overall']['f1'])
+
     # Load test data and evaluate
     test_loader_family, test_stats = data_loader.load_split('test', use_groups=False, batch_size=32)
     test_loader_groups, test_group_stats = data_loader.load_split('test', use_groups=True, batch_size=32)
@@ -660,3 +776,100 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+# def test_run():
+#     # Set device
+#     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
+#     # Initialize data loader
+#     data_loader = TemporalMalwareDataLoader(
+#         batch_dir=Path('/data/saranyav/gcn_new/bodmas_batches'),
+#         behavioral_groups_path=Path('/data/saranyav/gcn_new/behavioral_analysis/behavioral_groups.json'),
+#         metadata_path=Path('bodmas_metadata_cleaned.csv'),
+#         malware_types_path=Path('bodmas_malware_category.csv')
+#     )
+    
+#     # Load a small subset of data
+#     def load_small_split(split, use_groups, batch_size, max_batches=2):
+#         loader, stats = data_loader.load_split(split, use_groups=use_groups, batch_size=batch_size)
+#         # Take only first max_batches batches
+#         subset = []
+#         for i, batch in enumerate(loader):
+#             if i >= max_batches:
+#                 break
+#             subset.append(batch)
+#         return DataLoader(sum([list(batch.to_data_list()) for batch in subset], []), batch_size=batch_size), stats
+
+#     # Load small subsets
+#     train_loader_family, train_stats = load_small_split('train', False, batch_size=32)
+#     val_loader_family, val_stats = load_small_split('val', False, batch_size=32)
+    
+#     # Get number of classes
+#     num_family_classes = data_loader.get_num_classes(use_groups=False)
+    
+#     if num_family_classes == 0:
+#         raise ValueError("No classes found in the dataset")
+    
+#     # Initialize model with smaller architecture for testing
+#     family_model = MalwareGNN(
+#         num_node_features=14,
+#         hidden_dim=64,  # Smaller hidden dimension
+#         num_classes=num_family_classes,
+#         n_centroids_per_class=2,  # Fewer centroids
+#         num_layers=2,  # Fewer layers
+#         dropout=0.2
+#     ).to(device)
+    
+#     # Initialize trainer
+#     family_trainer = MalwareTrainer(
+#         model=family_model, 
+#         device=device,
+#         lr=0.001,
+#         weight_decay=1e-4
+#     )
+    
+#     # Compute class weights
+#     family_weights = family_trainer.compute_class_weights(train_loader_family)
+    
+#     if family_weights is None:
+#         raise ValueError("Failed to compute class weights")
+    
+#     # Training parameters
+#     num_epochs = 2  # Just a few epochs for testing
+    
+#     # Quick training loop
+#     for epoch in range(num_epochs):
+#         # Train and evaluate family model
+#         family_train_metrics = family_trainer.train_epoch(train_loader_family, family_weights)
+#         family_val_metrics = family_trainer.evaluate(val_loader_family, family_weights)
+        
+#         # Log metrics with correct structure
+#         logger.info(f"\nEpoch {epoch + 1}/{num_epochs}")
+#         logger.info(f"Training - Loss: {family_train_metrics['loss']:.4f}, Accuracy: {family_train_metrics['accuracy']:.4f}")
+        
+#         # Validation metrics have a different structure with per-class and overall metrics
+#         logger.info(f"Validation - Loss: {family_val_metrics['loss']:.4f}")
+#         if 'overall' in family_val_metrics:
+#             logger.info("Validation Overall Metrics:")
+#             for metric, value in family_val_metrics['overall'].items():
+#                 logger.info(f"- {metric}: {value:.4f}")
+                
+#         if 'novelty' in family_val_metrics:
+#             logger.info("Novelty Detection Metrics:")
+#             for metric, value in family_val_metrics['novelty'].items():
+#                 if isinstance(value, float):
+#                     logger.info(f"- {metric}: {value:.4f}")
+#                 else:
+#                     logger.info(f"- {metric}: {value}")
+        
+#         # Save checkpoint
+#         torch.save({
+#             'epoch': epoch,
+#             'model_state_dict': family_model.state_dict(),
+#             'optimizer_state_dict': family_trainer.optimizer.state_dict(),
+#             'metrics': family_val_metrics,
+#         }, f'test_checkpoint_epoch_{epoch}.pt')
+
+# if __name__ == "__main__":
+#     test_run()
