@@ -101,44 +101,27 @@ class TimestampCleaner:
 
 class GraphConverter:
     """Convert graph structures to PyTorch Geometric format."""
-    
     @staticmethod
     def convert_to_pytorch_geometric(graph_structure: Dict) -> Data:
         """Convert graph structure to PyG format with error handling."""
         try:
-            # Extract feature keys
-            feature_keys = sorted(list({
-                key for node in graph_structure['node_features'] 
-                for key in node.keys() if key != 'id'
-            }))
+            # Handle node features directly as a list
+            node_feats = torch.tensor(graph_structure['node_features'], dtype=torch.float)
             
-            # Create feature vectors
-            node_feats = []
-            for node in graph_structure['node_features']:
-                feats = [
-                    float(node.get(key, 0)) if not isinstance(node.get(key), bool)
-                    else float(node.get(key, False))
-                    for key in feature_keys
-                ]
-                node_feats.append(feats)
-            
-            # Convert to tensors with proper error handling
-            x = torch.tensor(node_feats, dtype=torch.float) if node_feats else \
-                torch.zeros((len(graph_structure['node_features']), len(feature_keys)), dtype=torch.float)
-            
+            # Convert edge indices
             edge_index = torch.tensor(graph_structure['edge_index'], dtype=torch.long).t() \
                 if graph_structure['edge_index'] else torch.zeros((2, 0), dtype=torch.long)
             
-            # Handle edge features if present, otherwise assign default edge attributes
+            # Handle edge features if present
             if graph_structure.get('edge_features'):
                 edge_feats = [[float(edge.get('condition', False) is not None)] 
                              for edge in graph_structure['edge_features']]
                 edge_attr = torch.tensor(edge_feats, dtype=torch.float)
             else:
-                edge_attr = torch.zeros((edge_index.size(1), 1), dtype=torch.float)  # Default to zeros
+                edge_attr = torch.zeros((edge_index.size(1), 1), dtype=torch.float)
             
-            data = Data(x=x, edge_index=edge_index, edge_attr=edge_attr)
-            data.num_nodes = x.size(0)
+            data = Data(x=node_feats, edge_index=edge_index, edge_attr=edge_attr)
+            data.num_nodes = node_feats.size(0)
             return data
             
         except Exception as e:
@@ -273,8 +256,8 @@ def main():
     processor = DatasetProcessor(
         primary_metadata_path='bodmas_metadata_cleaned.csv',
         malware_types_path='bodmas_malware_category.csv',  # Add path to your malware types file
-        data_dir='cfg_analysis_results/cfg_analysis_results',
-        output_dir='bodmas_batches_new',
+        data_dir='/data/saranyav/gcn_new/cfg_features',
+        output_dir='bodmas_batches',
         batch_size=100,
         train_ratio=0.7,
         val_ratio=0.15

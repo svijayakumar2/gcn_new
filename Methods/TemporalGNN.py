@@ -457,7 +457,7 @@ def main():
     
     # Initialize data loader
     data_loader = TemporalMalwareDataLoader(
-        batch_dir=Path('/data/saranyav/gcn_new/bodmas_batches_new'),
+        batch_dir=Path('/data/saranyav/gcn_new/bodmas_batches'),
         behavioral_groups_path=Path('/data/saranyav/gcn_new/behavioral_analysis/behavioral_groups.json'),
         metadata_path=Path('bodmas_metadata_cleaned.csv'),
         malware_types_path=Path('bodmas_malware_category.csv')
@@ -504,7 +504,8 @@ def main():
     
     # Training parameters
     num_epochs = 100
-    early_stopping_patience = 5
+    # early stopping: less stopping is 
+    early_stopping_patience = 15
     best_family_f1 = 0
     best_family_acc = 0
     best_group_f1 = 0

@@ -254,139 +254,124 @@ class ParallelBAPProcessor:
         self.processed_files.add(cfg_file)
 
     def parse_and_save(self, cfg_file: str) -> bool:
-        """Parse a single BAP CFG file and save its graph structure efficiently."""
-        try:
-            with open(cfg_file, 'r') as f:
-                content = f.read()
+            """Parse a single BAP CFG file and save its graph structure efficiently."""
+            try:
+                with open(cfg_file, 'r') as f:
+                    content = f.read()
 
-            G = nx.DiGraph()
+                G = nx.DiGraph()
+                    
+                # Parse nodes with improved instruction parsing
+                node_pattern = r'"\\%(.*?)"(\[label="([^"]*?)"\])?'
+                for match in re.finditer(node_pattern, content):
+                    node_id, _, label = match.groups()
+                    if node_id:
+                        node_attrs = {
+                            'instructions': [],
+                            'mem_ops': [],
+                            'calls': []
+                        }
+                        
+                        if label:
+                            # Split by \l and process each line
+                            lines = label.split('\\l')
+                            for line in lines:
+                                if ':' in line:
+                                    # Split only on first colon to preserve instruction content
+                                    parts = line.split(':', 1)
+                                    if len(parts) == 2:
+                                        instr = parts[1].strip()
+                                        if instr:
+                                            node_attrs['instructions'].append(instr)
+                                            if 'mem[' in instr or 'mem with' in instr:
+                                                node_attrs['mem_ops'].append(instr)
+                                            if 'call' in instr:
+                                                node_attrs['calls'].append(instr)
+                        
+                        G.add_node(node_id, **node_attrs)
                 
-            # Parse nodes
-            node_pattern = r'"\\%(.*?)"(\[label="(.*?)"\])?'
-            for match in re.finditer(node_pattern, content):
-                node_id, _, label = match.groups()
-                if node_id:
-                    node_attrs = {
-                        'instructions': [],
-                        'mem_ops': [],
-                        'calls': []
+                # Rest of the existing code...
+                edge_pattern = r'"\\%(.*?)" -> "\\%(.*?)"(\[label="(.*?)"\])?'
+                for match in re.finditer(edge_pattern, content):
+                    src, dst, _, label = match.groups()
+                    if src in G.nodes() and dst in G.nodes():
+                        G.add_edge(src, dst, condition=label if label else None)
+
+                if not G.number_of_nodes():
+                    print(f"Warning: Empty graph for {cfg_file}")
+                    return False
+
+                # Create node mapping and node features
+                node_mapping = {node: idx for idx, node in enumerate(G.nodes())}
+                
+                # Create edge list in COO format and edge features
+                edge_index = []
+                edge_features = []
+                for src, dst, data in G.edges(data=True):
+                    edge_index.append([node_mapping[src], node_mapping[dst]])
+                    edge_features.append({'condition': data.get('condition', None)})
+                
+                # Create node features with consistent feature set
+                node_features = []
+                for node in G.nodes():
+                    node_data = G.nodes[node]
+                    features = {
+                        'mem_ops': len(node_data.get('mem_ops', [])),
+                        'calls': len(node_data.get('calls', [])),
+                        'instructions': len(node_data.get('instructions', [])),
+                        'stack_ops': sum(1 for instr in node_data.get('instructions', []) 
+                                    if 'RSP' in instr or 'ESP' in instr),
+                        'reg_writes': sum(1 for instr in node_data.get('instructions', []) 
+                                        if ':=' in instr),
+                        'external_calls': sum(1 for call in node_data.get('calls', []) 
+                                            if ':external' in call),
+                        'internal_calls': sum(1 for call in node_data.get('calls', []) 
+                                            if ':external' not in call),
+                        'mem_reads': sum(1 for op in node_data.get('mem_ops', []) 
+                                    if 'mem[' in op and ':=' not in op),
+                        'mem_writes': sum(1 for op in node_data.get('mem_ops', []) 
+                                        if 'mem with' in op),
+                        'in_degree': G.in_degree(node),
+                        'out_degree': G.out_degree(node),
+                        'is_conditional': int(any('CF' in instr or 'ZF' in instr 
+                                            for instr in node_data.get('instructions', []))),
+                        'has_jump': int(any('jmp' in instr.lower() 
+                                        for instr in node_data.get('instructions', []))),
+                        'has_ret': int(any('ret' in instr.lower() 
+                                        for instr in node_data.get('instructions', [])))
                     }
-                    
-                    if label:
-                        for line in label.split('\\l'):
-                            if ':' in line:
-                                instr = line.split(':', 1)[1].strip()
-                                node_attrs['instructions'].append(instr)
-                                if 'mem' in instr:
-                                    node_attrs['mem_ops'].append(instr)
-                                if 'call' in instr:
-                                    node_attrs['calls'].append(instr)
-                    
-                    G.add_node(node_id, **node_attrs)
-            
-            # Parse edges
-            edge_pattern = r'"\\%(.*?)" -> "\\%(.*?)"(\[label="(.*?)"\])?'
-            for match in re.finditer(edge_pattern, content):
-                src, dst, _, label = match.groups()
-                if src in G.nodes() and dst in G.nodes():
-                    G.add_edge(src, dst, condition=label if label else None)
+                    node_features.append(features)
 
-            if not G.number_of_nodes():
-                print(f"Warning: Empty graph for {cfg_file}")
-                return False
+                print(f"Processing {cfg_file}")
+                filename = cfg_file.rsplit('/', 1)[-1]
+                hash_part = filename.split('_')[0]
+                print(hash_part)
 
-            # Create node mapping and node features
-            node_mapping = {node: idx for idx, node in enumerate(G.nodes())}
-            
-            # Create edge list in COO format and edge features
-            edge_index = []
-            edge_features = []
-            for src, dst, data in G.edges(data=True):
-                edge_index.append([node_mapping[src], node_mapping[dst]])
-                edge_features.append({'condition': data.get('condition', None)})
-            
-            # Create node features with consistent feature set
-            node_features = []
-            for node in G.nodes():
-                node_data = G.nodes[node]
-                # Initialize all features to 0
-                features = {
-                    'mem_ops': 0,
-                    'calls': 0,
-                    'instructions': 0,
-                    'stack_ops': 0,
-                    'reg_writes': 0,
-                    'external_calls': 0,
-                    'internal_calls': 0,
-                    'mem_reads': 0,
-                    'mem_writes': 0,
-                    'in_degree': 0,
-                    'out_degree': 0,
-                    'is_conditional': 0,
-                    'has_jump': 0,
-                    'has_ret': 0
+                output_file = os.path.join(self.output_path, f"{hash_part}.json.gz")
+                print(f"Saving to {output_file}")
+                            
+                data = {
+                    'file': cfg_file,
+                    'graph_structure': {
+                        'num_nodes': G.number_of_nodes(),
+                        'node_features': convert_node_features_to_tensor(node_features).tolist(),
+                        'edge_index': edge_index,
+                        'edge_features': [f for f in edge_features if f['condition'] is not None],
+                        'node_mapping': node_mapping
+                    },
+                    'timestamp': datetime.datetime.now().isoformat()
                 }
                 
-                # Update with actual values
-                features.update({
-                    'mem_ops': len(node_data.get('mem_ops', [])),
-                    'calls': len(node_data.get('calls', [])),
-                    'instructions': len(node_data.get('instructions', [])),
-                    'stack_ops': sum(1 for instr in node_data.get('instructions', []) 
-                                if 'RSP' in instr or 'ESP' in instr),
-                    'reg_writes': sum(1 for instr in node_data.get('instructions', []) 
-                                    if ':=' in instr),
-                    'external_calls': sum(1 for call in node_data.get('calls', []) 
-                                        if ':external' in call),
-                    'internal_calls': sum(1 for call in node_data.get('calls', []) 
-                                        if ':external' not in call),
-                    'mem_reads': sum(1 for op in node_data.get('mem_ops', []) 
-                                if 'mem[' in op and ':=' not in op),
-                    'mem_writes': sum(1 for op in node_data.get('mem_ops', []) 
-                                    if 'mem with' in op),
-                    'in_degree': G.in_degree(node),
-                    'out_degree': G.out_degree(node),
-                    'is_conditional': int(any('CF' in instr or 'ZF' in instr 
-                                        for instr in node_data.get('instructions', []))),
-                    'has_jump': int(any('jmp' in instr.lower() 
-                                    for instr in node_data.get('instructions', []))),
-                    'has_ret': int(any('ret' in instr.lower() 
-                                    for instr in node_data.get('instructions', [])))
-                })
-                
-                node_features.append(features)
+                with gzip.open(output_file, 'wt') as f:
+                    json.dump(data, f, separators=(',', ':'))
 
-            # Save with compression
-            print(f"Processing {cfg_file}")
-            filename = cfg_file.rsplit('/', 1)[-1]
-            hash_part = filename.split('_')[0]
-            print(hash_part)
+                return True
 
-            output_file = os.path.join(self.output_path, f"{hash_part}.json.gz")
-            print(f"Saving to {output_file}")
-                        
-            data = {
-                'file': cfg_file,
-                'graph_structure': {
-                    'num_nodes': G.number_of_nodes(),
-                    'node_features': convert_node_features_to_tensor(node_features).tolist(),
-                    'edge_index': edge_index,
-                    'edge_features': [f for f in edge_features if f['condition'] is not None],
-                    'node_mapping': node_mapping
-                },
-                'timestamp': datetime.datetime.now().isoformat()
-            }
-            
-            with gzip.open(output_file, 'wt') as f:
-                json.dump(data, f, separators=(',', ':'))
-
-            return True
-
-        except Exception as e:
-            print(f"Error processing {cfg_file}: {str(e)}")
-            with open(os.path.join(self.output_path, 'errors.log'), 'a') as f:
-                f.write(f"{datetime.datetime.now()}: Error in {cfg_file}: {str(e)}\n")
-            return False
+            except Exception as e:
+                print(f"Error processing {cfg_file}: {str(e)}")
+                with open(os.path.join(self.output_path, 'errors.log'), 'a') as f:
+                    f.write(f"{datetime.datetime.now()}: Error in {cfg_file}: {str(e)}\n")
+                return False
             
     def process_batch(self, cfg_patterns):
         """Process files matching one or more patterns in parallel.
@@ -453,15 +438,17 @@ class ParallelBAPProcessor:
         with gzip.open(os.path.join(self.output_path, 'combined_analysis.json.gz'), 'wt') as f:
             json.dump(all_results, f, separators=(',', ':'))
 
+
+
 def main():
     # Initialize processor
     processor = ParallelBAPProcessor(
         num_workers=mp.cpu_count(),
-        output_path='cfg_analysis_results2'
+        output_path='/data/saranyav/gcn_new/cfg_features'
     )
     
     # Define path pattern for CFG files
-    cfg_pattern = '/large/bodmas/exe_cfg/*_refang_cfg.exe'
+    cfg_pattern = '/data/datasets/bodmas/exe_cfg/*_refang_cfg.exe'
     
     # Process files
     processor.process_batch(cfg_pattern)

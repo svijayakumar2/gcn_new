@@ -38,6 +38,161 @@ from torch_geometric.nn import global_mean_pool
 
 
 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch_geometric.nn import GCNConv, GAT, GATv2Conv, global_mean_pool, global_add_pool, global_max_pool
+from typing import Tuple, Optional
+import logging
+
+logger = logging.getLogger(__name__)
+
+class AttentionReadout(nn.Module):
+    def __init__(self, hidden_dim):
+        super().__init__()
+        self.attention = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.Tanh(),
+            nn.Linear(hidden_dim, 1, bias=False)
+        )
+
+    def forward(self, x, batch):
+        # x shape: [num_nodes, hidden_dim]
+        # Compute attention weights
+        weights = self.attention(x)  # [num_nodes, 1]
+        weights = F.softmax(weights, dim=0)  # Normalize over all nodes
+        
+        # Weighted sum of node features
+        out = torch.zeros_like(x)
+        for b in torch.unique(batch):
+            mask = (batch == b)
+            batch_weights = weights[mask]
+            batch_x = x[mask]
+            out[mask] = batch_weights * batch_x
+        
+        return global_add_pool(out, batch)
+
+class GraphBlock(nn.Module):
+    def __init__(self, in_dim, out_dim, heads=4, dropout=0.1):
+        super().__init__()
+        self.gat = GATv2Conv(in_dim, out_dim // heads, heads=heads, dropout=dropout)
+        self.gcn = GCNConv(in_dim, out_dim)
+        self.bn = nn.BatchNorm1d(out_dim)
+        self.dropout = nn.Dropout(dropout)
+        
+        # Linear projection for residual if dimensions don't match
+        self.residual = nn.Linear(in_dim, out_dim) if in_dim != out_dim else nn.Identity()
+
+    def forward(self, x, edge_index):
+        # Parallel GAT and GCN
+        gat_out = self.gat(x, edge_index)
+        gcn_out = self.gcn(x, edge_index)
+        
+        # Combine GAT and GCN outputs
+        out = gat_out + gcn_out
+        
+        # Residual connection
+        residual = self.residual(x)
+        out = out + residual
+        
+        # Normalization and nonlinearity
+        out = self.bn(out)
+        out = F.elu(out)
+        out = self.dropout(out)
+        
+        return out
+
+class MalwareGNN(nn.Module):
+    def __init__(self, 
+                 num_node_features: int, 
+                 hidden_dim: int, 
+                 num_classes: int,
+                 n_centroids_per_class: int = 4,
+                 num_layers: int = 4,
+                 dropout: float = 0.2):
+        super().__init__()
+        
+        if num_classes <= 0:
+            raise ValueError(f"Invalid number of classes: {num_classes}")
+            
+        logger.info(f"Initializing Enhanced MalwareGNN with {num_classes} classes")
+        
+        self.num_classes = num_classes
+        self.num_known_classes = num_classes
+        self.hidden_dim = hidden_dim
+        
+        # Initial feature projection
+        self.feature_proj = nn.Sequential(
+            nn.Linear(num_node_features, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout)
+        )
+        
+        # Stack of GraphBlocks
+        self.blocks = nn.ModuleList([
+            GraphBlock(
+                hidden_dim if i == 0 else hidden_dim * 2**min(i-1, 2),
+                hidden_dim * 2**min(i, 2),
+                dropout=dropout
+            ) for i in range(num_layers)
+        ])
+        
+        # Multiple readout functions
+        final_dim = hidden_dim * 2**min(num_layers-1, 2)
+        self.attention_readout = AttentionReadout(final_dim)
+        
+        # Feature aggregation
+        self.feature_agg = nn.Sequential(
+            nn.Linear(final_dim * 3, final_dim),
+            nn.LayerNorm(final_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout)
+        )
+        
+        # Centroid layer for pattern detection with increased centroids
+        self.centroid = CentroidLayer(
+            feature_dim=final_dim,
+            num_classes=num_classes,
+            n_centroids_per_class=n_centroids_per_class
+        )
+
+    def forward(self, data):
+        try:
+            # Extract features and connectivity
+            x, edge_index = data.x, data.edge_index
+            batch = data.batch if hasattr(data, 'batch') else torch.zeros(x.size(0), dtype=torch.long, device=x.device)
+            
+            if x.size(0) == 0:
+                raise ValueError("Empty feature tensor")
+            
+            # Initial feature projection
+            x = self.feature_proj(x)
+            
+            # Apply GraphBlocks with dense connections
+            block_outputs = []
+            for block in self.blocks:
+                x = block(x, edge_index)
+                block_outputs.append(x)
+            
+            # Multiple readout strategies
+            att_pool = self.attention_readout(x, batch)
+            mean_pool = global_mean_pool(x, batch)
+            max_pool = global_max_pool(x, batch)
+            
+            # Combine different pooling strategies
+            combined = torch.cat([att_pool, mean_pool, max_pool], dim=1)
+            x = self.feature_agg(combined)
+            
+            # Centroid-based classification
+            logits, outlier_scores = self.centroid(x)
+            
+            return logits, outlier_scores
+            
+        except Exception as e:
+            logger.error(f"Error in forward pass: {str(e)}")
+            logger.error(f"Input shapes - x: {x.shape}, edge_index: {edge_index.shape}")
+            raise
 
 class GCN(torch.nn.Module):
     def __init__(self, hidden_channels):
@@ -387,80 +542,80 @@ class CentroidLayer(nn.Module):
             mask[i, i * n_centroids:(i + 1) * n_centroids] = 1.0
         return mask
 
-class MalwareGNN(nn.Module):
-    def __init__(self, num_node_features: int, hidden_dim: int, num_classes: int,
-                 n_centroids_per_class: int = 2):
-        super().__init__()
+# class MalwareGNN(nn.Module):
+#     def __init__(self, num_node_features: int, hidden_dim: int, num_classes: int,
+#                  n_centroids_per_class: int = 2):
+#         super().__init__()
         
-        # Validate inputs
-        if num_classes <= 0:
-            raise ValueError(f"Invalid number of classes: {num_classes}")
+#         # Validate inputs
+#         if num_classes <= 0:
+#             raise ValueError(f"Invalid number of classes: {num_classes}")
             
-        logger.info(f"Initializing MalwareGNN with {num_classes} classes")
+#         logger.info(f"Initializing MalwareGNN with {num_classes} classes")
         
-        # Store dimensions
-        self.num_classes = num_classes
-        self.num_known_classes = num_classes
-        self.hidden_dim = hidden_dim
+#         # Store dimensions
+#         self.num_classes = num_classes
+#         self.num_known_classes = num_classes
+#         self.hidden_dim = hidden_dim
         
-        # GNN layers
-        self.conv1 = GCNConv(num_node_features, hidden_dim)
-        self.conv2 = GCNConv(hidden_dim, hidden_dim)
-        self.conv3 = GCNConv(hidden_dim, hidden_dim)
+#         # GNN layers
+#         self.conv1 = GCNConv(num_node_features, hidden_dim)
+#         self.conv2 = GCNConv(hidden_dim, hidden_dim)
+#         self.conv3 = GCNConv(hidden_dim, hidden_dim)
         
-        # Batch normalization
-        self.bn1 = nn.BatchNorm1d(hidden_dim)
-        self.bn2 = nn.BatchNorm1d(hidden_dim)
-        self.bn3 = nn.BatchNorm1d(hidden_dim)
+#         # Batch normalization
+#         self.bn1 = nn.BatchNorm1d(hidden_dim)
+#         self.bn2 = nn.BatchNorm1d(hidden_dim)
+#         self.bn3 = nn.BatchNorm1d(hidden_dim)
         
-        # Dropout for regularization
-        self.dropout = nn.Dropout(0.5)
+#         # Dropout for regularization
+#         self.dropout = nn.Dropout(0.5)
         
-        # Centroid layer for behavioral pattern detection
-        self.centroid = CentroidLayer(
-            feature_dim=hidden_dim,
-            num_classes=num_classes,
-            n_centroids_per_class=n_centroids_per_class
-        )
+#         # Centroid layer for behavioral pattern detection
+#         self.centroid = CentroidLayer(
+#             feature_dim=hidden_dim,
+#             num_classes=num_classes,
+#             n_centroids_per_class=n_centroids_per_class
+#         )
 
-    def forward(self, data):
-        try:
-            # Extract features and connectivity
-            x, edge_index = data.x, data.edge_index
-            batch = data.batch if hasattr(data, 'batch') else torch.zeros(x.size(0), dtype=torch.long, device=x.device)
+#     def forward(self, data):
+#         try:
+#             # Extract features and connectivity
+#             x, edge_index = data.x, data.edge_index
+#             batch = data.batch if hasattr(data, 'batch') else torch.zeros(x.size(0), dtype=torch.long, device=x.device)
             
-            # Validate inputs
-            if x.size(0) == 0:
-                raise ValueError("Empty feature tensor")
+#             # Validate inputs
+#             if x.size(0) == 0:
+#                 raise ValueError("Empty feature tensor")
                 
-            # First GCN layer
-            x1 = self.conv1(x, edge_index)
-            x1 = self.bn1(x1)
-            x1 = F.relu(x1)
-            x1 = self.dropout(x1)
+#             # First GCN layer
+#             x1 = self.conv1(x, edge_index)
+#             x1 = self.bn1(x1)
+#             x1 = F.relu(x1)
+#             x1 = self.dropout(x1)
             
-            # Second GCN layer with residual connection
-            x2 = self.conv2(x1, edge_index)
-            x2 = self.bn2(x2)
-            x2 = F.relu(x2)
-            x2 = self.dropout(x2)
-            x2 = x2 + x1  # Residual connection
+#             # Second GCN layer with residual connection
+#             x2 = self.conv2(x1, edge_index)
+#             x2 = self.bn2(x2)
+#             x2 = F.relu(x2)
+#             x2 = self.dropout(x2)
+#             x2 = x2 + x1  # Residual connection
             
-            # Third GCN layer
-            x3 = self.conv3(x2, edge_index)
-            x3 = self.bn3(x3)
-            x3 = F.relu(x3)
-            x3 = x3 + x2  # Residual connection
+#             # Third GCN layer
+#             x3 = self.conv3(x2, edge_index)
+#             x3 = self.bn3(x3)
+#             x3 = F.relu(x3)
+#             x3 = x3 + x2  # Residual connection
             
-            # Global pooling
-            x = global_mean_pool(x3, batch)
+#             # Global pooling
+#             x = global_mean_pool(x3, batch)
             
-            # Centroid-based classification
-            logits, outlier_scores = self.centroid(x)
+#             # Centroid-based classification
+#             logits, outlier_scores = self.centroid(x)
             
-            return logits, outlier_scores
+#             return logits, outlier_scores
             
-        except Exception as e:
-            logger.error(f"Error in forward pass: {str(e)}")
-            logger.error(f"Input shapes - x: {x.shape}, edge_index: {edge_index.shape}")
-            raise
+#         except Exception as e:
+#             logger.error(f"Error in forward pass: {str(e)}")
+#             logger.error(f"Input shapes - x: {x.shape}, edge_index: {edge_index.shape}")
+#             raise

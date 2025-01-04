@@ -633,7 +633,7 @@ class MalwareBehaviorAggregator:
 def main():
     # Initialize processor
     aggregator = MalwareBehaviorAggregator(
-        batch_dir=Path('bodmas_batches_new')
+        batch_dir=Path('bodmas_batches')
     )
     
     # Load processed data
