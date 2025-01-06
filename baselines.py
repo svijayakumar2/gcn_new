@@ -215,39 +215,60 @@ class BaselineAnalyzer:
         # Store results
         self.results['isolation_forest'] = self._compute_novelty_metrics(y_test, iso_preds)
         self.results['one_class_svm'] = self._compute_novelty_metrics(y_test, svm_preds)
-    
     def _compute_metrics(self, y_true, y_pred) -> Dict:
-        """Compute classification metrics."""
+        """Compute classification metrics for behavioral groups."""
         metrics = {
             'accuracy': np.mean(y_true == y_pred),
-            'per_class': defaultdict(dict)
+            'per_group': defaultdict(dict),
+            'macro': {},
+            'weighted': {}
         }
         
-        # Per-class metrics
-        classes = np.unique(y_true)
-        for c in classes:
-            mask = y_true == c
+        # Calculate class frequencies for weighted metrics
+        class_counts = np.bincount(y_true)
+        total_samples = len(y_true)
+        weights = {i: count/total_samples for i, count in enumerate(class_counts)}
+        
+        # Per-group metrics
+        groups = np.unique(y_true)
+        for g in groups:
+            mask = y_true == g
             if mask.any():
-                tp = np.sum((y_true == c) & (y_pred == c))
-                fp = np.sum((y_true != c) & (y_pred == c))
-                fn = np.sum((y_true == c) & (y_pred != c))
+                tp = np.sum((y_true == g) & (y_pred == g))
+                fp = np.sum((y_true != g) & (y_pred == g))
+                fn = np.sum((y_true == g) & (y_pred != g))
                 
                 precision = tp / (tp + fp) if (tp + fp) > 0 else 0
                 recall = tp / (tp + fn) if (tp + fn) > 0 else 0
                 f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
                 
-                metrics['per_class'][int(c)] = {
+                metrics['per_group'][int(g)] = {
                     'precision': precision,
                     'recall': recall,
                     'f1': f1
                 }
         
-        # Overall metrics
-        metrics['overall'] = {
-            'precision': np.mean([m['precision'] for m in metrics['per_class'].values()]),
-            'recall': np.mean([m['recall'] for m in metrics['per_class'].values()]),
-            'f1': np.mean([m['f1'] for m in metrics['per_class'].values()])
-        }
+        # Only compute macro and weighted if we have per-group metrics
+        if metrics['per_group']:
+            # Macro metrics (simple average)
+            metrics['macro'] = {
+                'precision': np.mean([m['precision'] for m in metrics['per_group'].values()]),
+                'recall': np.mean([m['recall'] for m in metrics['per_group'].values()]),
+                'f1': np.mean([m['f1'] for m in metrics['per_group'].values()])
+            }
+            
+            # Weighted metrics (weighted by class frequency)
+            metrics['weighted'] = {
+                'precision': np.sum([metrics['per_group'][g]['precision'] * weights[g] 
+                                for g in metrics['per_group']]),
+                'recall': np.sum([metrics['per_group'][g]['recall'] * weights[g] 
+                                for g in metrics['per_group']]),
+                'f1': np.sum([metrics['per_group'][g]['f1'] * weights[g] 
+                            for g in metrics['per_group']])
+            }
+            
+            # For backward compatibility
+            metrics['overall'] = metrics['macro']
         
         return metrics
     
