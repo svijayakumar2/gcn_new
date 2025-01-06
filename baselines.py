@@ -323,7 +323,7 @@ class BaselineAnalyzer:
 def main():
     # Initialize data loader (using your existing TemporalMalwareDataLoader)
     data_loader = TemporalMalwareDataLoader(
-        batch_dir=Path('/data/saranyav/gcn_new/bodmas_batches_new'),
+        batch_dir=Path('/data/saranyav/gcn_new/bodmas_batches'),
         behavioral_groups_path=Path('/data/saranyav/gcn_new/behavioral_analysis/behavioral_groups.json'),
         metadata_path=Path('bodmas_metadata_cleaned.csv'),
         malware_types_path=Path('bodmas_malware_category.csv')

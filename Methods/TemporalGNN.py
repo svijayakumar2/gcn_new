@@ -56,7 +56,7 @@ def train_and_evaluate(trainer, train_loader, val_loader, class_weights,
         })
         
         # Save metrics to file
-        with open(f'{model_name}_metrics.json', 'w') as f:
+        with open(f'{model_name}_metrics2.json', 'w') as f:
             json.dump(metrics_history, f, indent=2, cls=NumpyEncoder)
         
         # Early stopping based on F1 score
@@ -603,9 +603,9 @@ def main():
         })
         
         # Save metrics to file
-        with open('family_metrics.json', 'w') as f:
+        with open('family_metrics2.json', 'w') as f:
             json.dump(family_metrics_history, f, indent=2, cls=NumpyEncoder)
-        with open('group_metrics.json', 'w') as f:
+        with open('group_metrics2.json', 'w') as f:
             json.dump(group_metrics_history, f, indent=2, cls=NumpyEncoder)
         
         # Early stopping based only on F1 score
@@ -771,7 +771,7 @@ def main():
         }
     }
     
-    with open('final_report.json', 'w') as f:
+    with open('final_report2.json', 'w') as f:
         json.dump(final_report, f, indent=2, cls=NumpyEncoder)
 
 if __name__ == "__main__":
