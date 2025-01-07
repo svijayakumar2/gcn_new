@@ -243,7 +243,7 @@ def main():
     logger.info(f"Using device: {device}")
     
     # Data preparation
-    base_dir = 'bodmas_batches'
+    base_dir = '/data/saranyav/gcn_new/bodmas_batches'
     splits = ['train', 'val', 'test']
     batch_files = {split: [] for split in splits}
     family_to_idx = {}
@@ -277,7 +277,7 @@ def main():
     optimizer = torch.optim.AdamW(model.parameters(), lr=0.001)
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=1, gamma=0.9)
     
-    num_epochs = 5
+    num_epochs = 40
     best_acc = 0
     
     for epoch in range(num_epochs):
@@ -351,7 +351,7 @@ def main():
                 'family_exemplars': detector.family_exemplars,
                 'accuracy': combined_acc,
                 'epoch': epoch
-            }, os.path.join(save_dir, 'best_model.pt'))
+            }, os.path.join(save_dir, 'best_model_exemplar.pt'))
             logger.info(f"Saved new best model with accuracy {combined_acc:.2%}")
 
     logger.info("Training complete!")
