@@ -192,12 +192,13 @@ class MalwareEvolutionAnalyzer:
             return "concurrent"
         return "first_to_second" if time1 < time2 else "second_to_first"
 
-    def visualize_family_relationships(self, min_samples: int = 3, output_file: str = None):
+    def visualize_family_relationships(self, min_samples: int = 3, max_samples: int=500, output_file: str = None):
         """Create a t-SNE visualization of family relationships."""
         # Filter families with enough samples
         valid_families = [f for f in self.samples_by_family 
                         if len(self.samples_by_family[f]) >= min_samples]
-        
+
+        valid_families = [f for f in valid_families if len(self.samples_by_family[f]) <= max_samples]
         if not valid_families:
             raise ValueError(f"No families with at least {min_samples} samples")
             
@@ -216,7 +217,7 @@ class MalwareEvolutionAnalyzer:
         feature_vecs = np.array(feature_vecs)
         
         # Apply t-SNE
-        tsne = TSNE(n_components=2, random_state=42)
+        tsne = TSNE(n_components=2, perplexity=30, random_state=42)
         embedded = tsne.fit_transform(feature_vecs)
         
         # Create visualization
@@ -278,12 +279,14 @@ class MalwareEvolutionAnalyzer:
         plt.tight_layout()
         return fig
 
-    def visualize_family_samples(self, num_families: int = 20, min_samples: int = 10, output_file: str = None):
+    def visualize_family_samples(self, num_families: int = 20, min_samples: int = 10, max_samples: int = 500, output_file: str = None):
         """Create a t-SNE visualization of individual samples from top families."""
         
         # Get the top N families by number of samples
         family_sizes = [(f, len(samples)) for f, samples in self.samples_by_family.items() 
                         if len(samples) >= min_samples]
+        # filter out families with more than max_samples
+        family_sizes = [(f, s) for f, s in family_sizes if s <= max_samples]
         top_families = sorted(family_sizes, key=lambda x: x[1], reverse=True)[:num_families]
         
         # Collect samples and labels
@@ -381,14 +384,14 @@ def main():
     # Visualize relationships
     print("\nGenerating visualization...")
     analyzer.visualize_family_relationships(
-        min_samples=3,
+        min_samples=3, max_samples=500, #  output_file='family_relationships.png'
         output_file='family_relationships.png'
     )
 
     analyzer.visualize_family_samples(
-        num_families=20,  # Number of top families to include
-        min_samples=10,   # Minimum samples needed for a family to be included
-        output_file='malware_samples_tsne.png'
+        num_families=10,  # Number of top families to include
+        min_samples=10, max_samples=500,  # Minimum samples needed for a family to be included
+        output_file='malware_samples_tsne_10.png'
     )
 
 if __name__ == "__main__":

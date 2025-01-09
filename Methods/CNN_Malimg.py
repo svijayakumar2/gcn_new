@@ -141,7 +141,7 @@ class MalwareTrainer:
             logits, novelty_scores = self.model(images)
             
             # Classification loss for known samples
-            known_mask = ~is_novel.bool()
+            known_mask = ~is_novel#.bool()
             if known_mask.any():
                 cls_loss = self.criterion(logits[known_mask], labels[known_mask])
             else:
@@ -334,6 +334,8 @@ def main():
         logger.info(f"Train Loss: {train_metrics['loss']:.4f}")
         logger.info(f"Train Accuracy: {train_metrics['accuracy']:.4f}")
         logger.info(f"Val Known F1: {val_metrics['known']['f1']:.4f}")
+        logger.info(f"Val Known Precision: {val_metrics['known']['precision']:.4f}")
+        logger.info(f"Val Known Recall: {val_metrics['known']['recall']:.4f}")
         logger.info(f"Val Novel Precision: {val_metrics['novel']['precision']:.4f}")
         logger.info(f"Val Novel Recall: {val_metrics['novel']['recall']:.4f}")
         

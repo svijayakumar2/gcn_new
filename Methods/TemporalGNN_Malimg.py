@@ -279,8 +279,18 @@ class MalwareTrainer:
                     average='weighted'
                 )
                 known_metrics['accuracy'] = (all_preds[known_mask] == all_labels[known_mask]).mean()
+                known_metrics['precision'] = precision_score(
+                    all_labels[known_mask],
+                    all_preds[known_mask],
+                    average='weighted'
+                )
+                known_metrics['recall'] = recall_score(
+                    all_labels[known_mask],
+                    all_preds[known_mask],
+                    average='weighted'
+                )
             else:
-                known_metrics = {'f1': 0.0, 'accuracy': 0.0}
+                known_metrics = {'f1': 0.0, 'accuracy': 0.0, 'precision': 0.0, 'recall': 0.0}
                 
             # Calculate metrics for novelty detection
             # Use 0.5 as threshold for novelty scores
@@ -537,6 +547,8 @@ def main():
         "known_families": dict(test_stats['known_families']),
         "novel_families": dict(test_stats['novel_families']),
         "known_f1": test_metrics['known']['f1'],
+        "known_precision": test_metrics['known']['precision'],
+        "known_recall": test_metrics['known']['recall'],
         "novel_precision": test_metrics['novel']['precision'],
         "novel_recall": test_metrics['novel']['recall']
     }
