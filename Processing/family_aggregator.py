@@ -8,6 +8,14 @@ import networkx as nx
 from tqdm import tqdm
 # counter
 from collections import Counter
+import json
+from datetime import datetime
+import traceback
+from collections import Counter
+import logging
+import numpy as np
+import json
+from pathlib import Path
 
 # Set up logging similar to your temporal.py
 logging.basicConfig(
@@ -15,6 +23,27 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+
+def _convert_to_native_types(obj):
+    """Convert numpy types to native Python types for JSON serialization."""
+    if isinstance(obj, dict):
+        return {_convert_to_native_types(k): _convert_to_native_types(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [_convert_to_native_types(i) for i in obj]
+    elif isinstance(obj, tuple):
+        return tuple(_convert_to_native_types(i) for i in obj)
+    elif isinstance(obj, (np.int_, np.intc, np.intp, np.int8, np.int16, np.int32, np.int64,
+                        np.uint8, np.uint16, np.uint32, np.uint64)):
+        return int(obj)
+    elif isinstance(obj, (np.float_, np.float16, np.float32, np.float64)):
+        return float(obj)
+    elif isinstance(obj, np.ndarray):
+        return _convert_to_native_types(obj.tolist())
+    elif isinstance(obj, np.bool_):
+        return bool(obj)
+    return obj
+
 
 class BehavioralSimilarityComputer:
     """Compute similarity between malware family behavioral profiles efficiently."""
@@ -112,10 +141,12 @@ class BehavioralSimilarityComputer:
 class MalwareBehaviorAggregator:
     """Aggregate behavioral patterns across malware families."""
     
-    def __init__(self, batch_dir: Path):
+    def __init__(self, batch_dir: Path, window_id: Optional[int] = None):
         self.batch_dir = Path(batch_dir)
+        self.window_id = window_id  # Track which window we're analyzing
         self.family_graphs = defaultdict(list)
         self.family_distributions = {}
+
 
     def _aggregate_family_behaviors(self, pyg_graphs: List) -> Dict:
         """
@@ -395,8 +426,14 @@ class MalwareBehaviorAggregator:
         }
 
     def load_processed_batches(self, split: str = 'train'):
-        """Load preprocessed PyG graphs from batches."""
-        split_dir = self.batch_dir / split
+        """Load preprocessed PyG graphs from batches considering rolling windows."""
+        # Modify path based on window structure
+        if self.window_id is not None:
+            split_dir = self.batch_dir / f"window_{self.window_id:03d}" / split
+        else:
+            # For final test set
+            split_dir = self.batch_dir / "test"
+            
         logger.info(f"Loading batches from {split_dir}")
         
         # Track malware types
@@ -630,48 +667,407 @@ class MalwareBehaviorAggregator:
         
         return best_labels, best_score
 
+
+def analyze_family_drift(all_groups: Dict, all_similarities: Dict, windows: List[int]) -> Dict:
+    """Analyze how individual families drift behaviorally over time."""
+    drift_metrics = defaultdict(list)
+    
+    # First, create a mapping of families to their group for each window
+    window_families = {}  # Track which families are in which window
+    family_to_group = {}  # Track which group each family is in for each window
+    
+    for window in windows:
+        window_families[window] = set()
+        family_to_group[window] = {}
+        for group_id, families in all_groups[window].items():
+            for family in families:
+                window_families[window].add(family)
+                family_to_group[window][family] = group_id
+    
+    # For each pair of consecutive windows
+    for i in range(len(windows)-1):
+        curr_window = windows[i]
+        next_window = windows[i+1]
+        
+        # Get common families between these windows
+        common_families = window_families[curr_window] & window_families[next_window]
+        logger.info(f"Windows {curr_window}->{next_window}: {len(common_families)} common families")
+        
+        curr_sim = all_similarities[curr_window]
+        next_sim = all_similarities[next_window]
+        
+        # For each family present in both windows
+        for family in common_families:
+            try:
+                # Get groups for this family in both windows
+                curr_group = family_to_group[curr_window][family]
+                next_group = family_to_group[next_window][family]
+                
+                # Get all families in the same groups
+                curr_group_families = all_groups[curr_window][curr_group]
+                next_group_families = all_groups[next_window][next_group]
+                
+                # Calculate average similarity to other families in group
+                curr_similarities = []
+                next_similarities = []
+                
+                for other_family in curr_group_families:
+                    if other_family != family and other_family in common_families:
+                        try:
+                            curr_idx1 = list(window_families[curr_window]).index(family)
+                            curr_idx2 = list(window_families[curr_window]).index(other_family)
+                            if curr_idx1 < curr_sim.shape[0] and curr_idx2 < curr_sim.shape[1]:
+                                curr_similarities.append(curr_sim[curr_idx1, curr_idx2])
+                        except ValueError:
+                            continue
+                
+                for other_family in next_group_families:
+                    if other_family != family and other_family in common_families:
+                        try:
+                            next_idx1 = list(window_families[next_window]).index(family)
+                            next_idx2 = list(window_families[next_window]).index(other_family)
+                            if next_idx1 < next_sim.shape[0] and next_idx2 < next_sim.shape[1]:
+                                next_similarities.append(next_sim[next_idx1, next_idx2])
+                        except ValueError:
+                            continue
+                
+                # Calculate drift only if we have valid similarities
+                if curr_similarities and next_similarities:
+                    curr_mean = float(np.mean(curr_similarities))
+                    next_mean = float(np.mean(next_similarities))
+                    # Avoid division by zero and handle very small numbers
+                    if abs(curr_mean) > 1e-10:
+                        drift_rate = 1 - next_mean / curr_mean
+                    else:
+                        drift_rate = 0.0 if abs(next_mean) < 1e-10 else 1.0
+                    
+                    drift_metrics[family].append({
+                        'window_transition': f"{curr_window}->{next_window}",
+                        'drift_rate': float(drift_rate),
+                        'group_change': curr_group != next_group,
+                        'num_comparisons': len(curr_similarities),
+                        'curr_group': curr_group,
+                        'next_group': next_group
+                    })
+            except Exception as e:
+                logger.debug(f"Error processing family {family} in windows {curr_window}->{next_window}: {str(e)}")
+                continue
+    
+    return dict(drift_metrics)
+
+def analyze_convergent_evolution(all_similarities: Dict, windows: List[int]) -> Dict:
+    """Identify cases where different families evolve similar behaviors."""
+    convergence_patterns = {}
+    
+    # Track window transitions
+    for i in range(len(windows)-1):
+        curr_window = windows[i]
+        next_window = windows[i+1]
+        
+        curr_sim = all_similarities[curr_window]
+        next_sim = all_similarities[next_window]
+        
+        if curr_sim.shape != next_sim.shape:
+            logger.warning(f"Similarity matrix shape mismatch between windows {curr_window} and {next_window}")
+            # Take the minimum dimensions
+            min_rows = min(curr_sim.shape[0], next_sim.shape[0])
+            min_cols = min(curr_sim.shape[1], next_sim.shape[1])
+            # Trim matrices to same size
+            curr_sim = curr_sim[:min_rows, :min_cols]
+            next_sim = next_sim[:min_rows, :min_cols]
+        
+        # Find pairs that become more similar
+        convergent_pairs = []
+        for i in range(curr_sim.shape[0]):
+            for j in range(i + 1, curr_sim.shape[1]):
+                try:
+                    curr_similarity = float(curr_sim[i, j])
+                    next_similarity = float(next_sim[i, j])
+                    
+                    if np.isnan(curr_similarity) or np.isnan(next_similarity):
+                        continue
+                    
+                    similarity_increase = next_similarity - curr_similarity
+                    if similarity_increase > 0.2:  # Threshold for significant increase
+                        convergent_pairs.append({
+                            'pair_indices': (int(i), int(j)),
+                            'similarity_increase': float(similarity_increase),
+                            'final_similarity': float(next_similarity),
+                            'initial_similarity': float(curr_similarity)
+                        })
+                except Exception as e:
+                    logger.debug(f"Error processing similarity pair ({i}, {j}): {str(e)}")
+                    continue
+        
+        convergence_patterns[f"{curr_window}->{next_window}"] = {
+            'num_convergent_pairs': len(convergent_pairs),
+            'convergent_pairs': convergent_pairs,
+            'matrix_shape': {
+                'rows': int(curr_sim.shape[0]),
+                'cols': int(curr_sim.shape[1])
+            }
+        }
+    
+    return convergence_patterns
+
+def analyze_group_stability(all_groups: Dict, windows: List[int]) -> Dict:
+    """Analyze how stable behavioral groups remain across windows."""
+    stability_metrics = {}
+    
+    for i in range(len(windows)-1):
+        curr_window = windows[i]
+        next_window = windows[i+1]
+        
+        try:
+            curr_groups = all_groups[curr_window]
+            next_groups = all_groups[next_window]
+        except KeyError as e:
+            logger.error(f"Missing window data: {e}")
+            continue
+            
+        # Track group changes
+        changes = {
+            'split': [],    # Groups that split into multiple groups
+            'merged': [],   # Groups that merged together
+            'stable': [],   # Groups that remained relatively stable
+            'new': [],      # Entirely new groups
+            'dissolved': [] # Groups that disappeared
+        }
+        
+        # Get sets of families for each window
+        curr_families = {f for fams in curr_groups.values() for f in fams}
+        next_families = {f for fams in next_groups.values() for f in fams}
+        
+        # Find new and dissolved families
+        new_families = next_families - curr_families
+        dissolved_families = curr_families - next_families
+        
+        # Track new and dissolved groups
+        for group_id, families in next_groups.items():
+            if any(f in new_families for f in families):
+                changes['new'].append(group_id)
+        
+        for group_id, families in curr_groups.items():
+            if all(f in dissolved_families for f in families):
+                changes['dissolved'].append(group_id)
+        
+        # Analyze group transitions
+        for curr_id, curr_families in curr_groups.items():
+            curr_families = set(curr_families) - dissolved_families
+            if not curr_families:
+                continue
+                
+            # Find where families went
+            destinations = defaultdict(set)
+            for family in curr_families:
+                for next_id, next_families in next_groups.items():
+                    if family in next_families and next_id not in changes['new']:
+                        destinations[next_id].add(family)
+            
+            # Classify the change
+            if len(destinations) == 0:
+                if curr_id not in changes['dissolved']:
+                    changes['dissolved'].append(curr_id)
+            elif len(destinations) == 1:
+                next_id = list(destinations.keys())[0]
+                overlap = len(destinations[next_id]) / len(curr_families)
+                if overlap >= 0.7:
+                    changes['stable'].append({
+                        'from_group': curr_id,
+                        'to_group': next_id,
+                        'overlap_ratio': float(overlap)
+                    })
+                else:
+                    changes['split'].append({
+                        'from_group': curr_id,
+                        'to_groups': [next_id],
+                        'distributions': {
+                            next_id: float(len(destinations[next_id]) / len(curr_families))
+                        }
+                    })
+            else:
+                total = sum(len(fams) for fams in destinations.values())
+                changes['split'].append({
+                    'from_group': curr_id,
+                    'to_groups': list(destinations.keys()),
+                    'distributions': {
+                        str(k): float(len(v) / total) 
+                        for k, v in destinations.items()
+                    }
+                })
+        
+        stability_metrics[f"{curr_window}->{next_window}"] = {
+            'num_split': len(changes['split']),
+            'num_merged': len(changes['merged']),
+            'num_stable': len(changes['stable']),
+            'num_new': len(changes['new']),
+            'num_dissolved': len(changes['dissolved']),
+            'changes': changes,
+            'stats': {
+                'total_families_start': len(curr_families),
+                'total_families_end': len(next_families),
+                'families_added': len(new_families),
+                'families_removed': len(dissolved_families)
+            }
+        }
+    
+    return stability_metrics
+
+def analyze_behavioral_evolution(all_groups: Dict, all_similarities: Dict) -> Dict:
+    """Analyze behavioral evolution across windows."""
+    if not all_groups or not all_similarities:
+        raise ValueError("Empty groups or similarities dictionary")
+        
+    windows = sorted(all_groups.keys())
+    if not all(w in all_similarities for w in windows):
+        raise ValueError("Mismatch between windows in groups and similarities")
+    
+    evolution_analysis = {
+        'group_stability': analyze_group_stability(all_groups, windows),
+        'family_drift': analyze_family_drift(all_groups, all_similarities, windows),
+        'convergent_evolution': analyze_convergent_evolution(all_similarities, windows)
+    }
+    return evolution_analysis
+
 def main():
-    # Initialize processor
-    aggregator = MalwareBehaviorAggregator(
-        batch_dir=Path('bodmas_batches')
-    )
-    
-    # Load processed data
-    aggregator.load_processed_batches(split='train')
-    
-    # Process families
-    aggregator.process_families()
-    
-    # Create behavioral groups
-    groups, similarity_matrix = aggregator.create_behavioral_groups()
-    
-    # Save results
+    """Modified main to handle rolling window analysis."""
+    base_dir = Path('bodmas_rolling')
     output_dir = Path('behavioral_analysis')
     output_dir.mkdir(exist_ok=True)
     
-    # Save similarity matrix
-    np.save(output_dir / 'similarity_matrix.npy', similarity_matrix)
+    # Initialize numpy for safe array operations
+    np.seterr(all='warn')
     
-    # Save groupings
-    import json
-    with open(output_dir / 'behavioral_groups.json', 'w') as f:
-        json.dump({str(k): v for k, v in groups.items()}, f, indent=2)
+    # Get list of all windows
+    windows = sorted([d for d in base_dir.glob("window_*") if d.is_dir()], 
+                    key=lambda x: int(x.name.split('_')[1]))
     
-    # Optionally visualize results
+    logger.info(f"Found {len(windows)} windows: {[w.name for w in windows]}")
+    
+    # Track behavioral evolution across windows
+    all_groups = {}
+    all_similarities = {}
+    
+    # Store family mappings for each window
+    window_family_maps = {}
+    
+    # Process each window
+    for window_dir in windows:
+        window_id = int(window_dir.name.split('_')[1])
+        logger.info(f"\nProcessing window {window_id}")
+        
+        # Initialize processor for this window
+        aggregator = MalwareBehaviorAggregator(
+            batch_dir=base_dir,
+            window_id=window_id
+        )
+        
+        # Load and process data for this window
+        aggregator.load_processed_batches(split='train')
+        
+        # Log family counts
+        logger.info(f"Window {window_id} loaded {len(aggregator.family_graphs)} families")
+        
+        # Store family list for this window
+        window_family_maps[window_id] = list(aggregator.family_graphs.keys())
+        
+        # Process families
+        aggregator.process_families()
+        logger.info(f"Window {window_id} processed {len(aggregator.family_distributions)} family distributions")
+        
+        # Log malware types distribution
+        type_counts = Counter(aggregator.malware_types.values())
+        logger.info("\nMalware type distribution:")
+        for mtype, count in type_counts.most_common():
+            logger.info(f"{mtype}: {count} families")
+        
+        # Create behavioral groups
+        groups, similarity_matrix = aggregator.create_behavioral_groups()
+        
+        logger.info(f"Window {window_id} created {len(groups)} behavioral groups")
+        logger.info(f"Similarity matrix shape: {similarity_matrix.shape}")
+        
+        # Store results for this window
+        all_groups[window_id] = groups
+        all_similarities[window_id] = similarity_matrix
+        
+        # Save window-specific results
+        window_output = output_dir / f"window_{window_id:03d}"
+        window_output.mkdir(exist_ok=True)
+        
+        # Save similarity matrix
+        np.save(window_output / 'similarity_matrix.npy', similarity_matrix)
+        
+        # Save behavioral groups and family mapping
+        with open(window_output / 'behavioral_groups.json', 'w') as f:
+            json.dump({
+                'groups': {str(k): v for k, v in groups.items()},
+                'family_mapping': {
+                    str(k): list(v) for k, v in aggregator.malware_types.items()
+                }
+            }, f, indent=2)
+    
+    # Log final collection summary
+    logger.info("\nAll windows processed. Summary:")
+    logger.info(f"Number of windows with groups: {len(all_groups)}")
+    logger.info(f"Windows with groups: {sorted(all_groups.keys())}")
+    logger.info(f"Number of windows with similarities: {len(all_similarities)}")
+    logger.info(f"Windows with similarities: {sorted(all_similarities.keys())}")
+    
+    # Save family mappings for all windows
+    with open(output_dir / 'window_family_mappings.json', 'w') as f:
+        json.dump({str(k): v for k, v in window_family_maps.items()}, f, indent=2)
+    
+    # Analyze behavioral evolution
+    logger.info("\nAnalyzing behavioral evolution across windows")
+    if not all_groups or not all_similarities:
+        logger.error("No data collected for analysis!")
+        logger.error(f"all_groups is empty: {len(all_groups) == 0}")
+        logger.error(f"all_similarities is empty: {len(all_similarities) == 0}")
+        return
+    
     try:
-        import seaborn as sns
-        import matplotlib.pyplot as plt
+        # Create directory for analysis results
+        analysis_dir = output_dir / 'analysis'
+        analysis_dir.mkdir(exist_ok=True)
         
-        plt.figure(figsize=(12, 10))
-        sns.heatmap(similarity_matrix, cmap='viridis')
-        plt.title('Family Similarity Matrix')
-        plt.tight_layout()
-        plt.savefig(output_dir / 'similarity_matrix.png')
-        plt.close()
+        # Run evolution analysis
+        evolution_results = analyze_behavioral_evolution(all_groups, all_similarities)
         
-        logger.info(f"Results saved to {output_dir}")
-    except ImportError:
-        logger.warning("Visualization skipped: seaborn/matplotlib not available")
+        # Convert results to JSON-serializable format
+        serializable_results = _convert_to_native_types(evolution_results)
+        
+        # Save detailed results in separate files
+        if 'group_stability' in serializable_results:
+            with open(analysis_dir / 'group_stability.json', 'w') as f:
+                json.dump(serializable_results['group_stability'], f, indent=2)
+                
+        if 'family_drift' in serializable_results:
+            with open(analysis_dir / 'family_drift.json', 'w') as f:
+                json.dump(serializable_results['family_drift'], f, indent=2)
+                
+        if 'convergent_evolution' in serializable_results:
+            with open(analysis_dir / 'convergent_evolution.json', 'w') as f:
+                json.dump(serializable_results['convergent_evolution'], f, indent=2)
+        
+        # Save summary results
+        with open(output_dir / 'evolution_analysis_summary.json', 'w') as f:
+            summary = {
+                'windows_analyzed': len(all_groups),
+                'window_ids': sorted(all_groups.keys()),
+                'total_families': sum(len(families) 
+                    for groups in all_groups.values() 
+                    for families in groups.values()),
+                'analysis_timestamp': datetime.now().isoformat()
+            }
+            json.dump(summary, f, indent=2)
+            
+        logger.info("Analysis complete and results saved.")
+        
+    except Exception as e:
+        logger.error(f"Error during evolution analysis: {str(e)}")
+        logger.error(traceback.format_exc())
+        raise
 
 if __name__ == "__main__":
     main()

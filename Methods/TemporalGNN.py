@@ -57,7 +57,7 @@ def train_and_evaluate(trainer, train_loader, val_loader, class_weights,
         })
         
         # Save metrics to file
-        with open(f'{model_name}_metrics2.json', 'w') as f:
+        with open(f'{model_name}_metrics_final.json', 'w') as f:
             json.dump(metrics_history, f, indent=2, cls=NumpyEncoder)
         
         # Early stopping based on F1 score
@@ -378,6 +378,150 @@ def analyze_behavioral_evolution(family_preds, group_preds, family_outliers, gro
                        f"Novelty Scores: {behavior['family_outlier_score']:.3f}, "
                        f"{behavior['group_outlier_score']:.3f}")
 
+def evaluate_novel_detection_thresholds(trainer, loader, save_prefix='') -> Dict:
+    """
+    Evaluate model's performance on novel family detection across multiple thresholds.
+    Saves results as numpy arrays for later plotting.
+    
+    Args:
+        trainer: Model trainer instance
+        loader: Data loader
+        save_prefix: Prefix for saved files (e.g., 'family' or 'group')
+        
+    Returns:
+        Dict containing best thresholds and metrics
+    """
+    trainer.model.eval()
+    
+    # Generate threshold combinations
+    confidence_thresholds = np.linspace(0.1, 0.9, 30)  # More granular thresholds
+    outlier_thresholds = np.linspace(0.1, 0.9, 30)
+    
+    # Store all predictions and true labels
+    all_confidences = []
+    all_outlier_scores = []
+    all_true_labels = []
+    
+    with torch.no_grad():
+        for batch in loader:
+            batch = batch.to(trainer.device)
+            
+            # Get model predictions and outlier scores
+            logits, outlier_scores = trainer.model(batch)
+            confidences = F.softmax(logits, dim=1).max(dim=1)[0]
+            
+            # Store batch results
+            all_confidences.extend(confidences.cpu().numpy())
+            all_outlier_scores.extend(outlier_scores.cpu().numpy())
+            all_true_labels.extend(batch.is_novel.cpu().numpy())
+    
+    # Convert to numpy arrays
+    confidences = np.array(all_confidences)
+    outlier_scores = np.array(all_outlier_scores)
+    true_labels = np.array(all_true_labels)
+    
+    # Save raw predictions for potential later analysis
+    np.savez(
+        f'{save_prefix}_novel_detection_raw.npz',
+        confidences=confidences,
+        outlier_scores=outlier_scores,
+        true_labels=true_labels
+    )
+    
+    # Store results for each threshold combination
+    precisions = []
+    recalls = []
+    f1_scores = []
+    conf_thresh_list = []
+    out_thresh_list = []
+    
+    for conf_thresh in confidence_thresholds:
+        for out_thresh in outlier_thresholds:
+            # Novel if high outlier score OR low confidence
+            pred_novel = (outlier_scores > out_thresh) | (confidences < conf_thresh)
+            
+            # Calculate metrics
+            tp = np.sum((pred_novel == True) & (true_labels == True))
+            fp = np.sum((pred_novel == True) & (true_labels == False))
+            fn = np.sum((pred_novel == False) & (true_labels == True))
+            
+            precision = tp / (tp + fp) if (tp + fp) > 0 else 0
+            recall = tp / (tp + fn) if (tp + fn) > 0 else 0
+            f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
+            
+            precisions.append(precision)
+            recalls.append(recall)
+            f1_scores.append(f1)
+            conf_thresh_list.append(conf_thresh)
+            out_thresh_list.append(out_thresh)
+    
+    # Convert to numpy arrays
+    precisions = np.array(precisions)
+    recalls = np.array(recalls)
+    f1_scores = np.array(f1_scores)
+    conf_thresh_list = np.array(conf_thresh_list)
+    out_thresh_list = np.array(out_thresh_list)
+    
+    # Save PR curve data
+    np.savez(
+        f'{save_prefix}_novel_detection_metrics.npz',
+        precisions=precisions,
+        recalls=recalls,
+        f1_scores=f1_scores,
+        confidence_thresholds=conf_thresh_list,
+        outlier_thresholds=out_thresh_list
+    )
+    
+    # Find best F1 configuration
+    best_idx = np.argmax(f1_scores)
+    best_result = {
+        'confidence_threshold': conf_thresh_list[best_idx],
+        'outlier_threshold': out_thresh_list[best_idx],
+        'precision': precisions[best_idx],
+        'recall': recalls[best_idx],
+        'f1': f1_scores[best_idx]
+    }
+    
+    return {
+        'best_thresholds': {
+            'confidence': best_result['confidence_threshold'],
+            'outlier': best_result['outlier_threshold']
+        },
+        'best_metrics': {
+            'precision': best_result['precision'],
+            'recall': best_result['recall'],
+            'f1': best_result['f1']
+        }
+    }
+
+import os 
+import glob
+
+def cleanup_old_checkpoints(name, keep_last_n=5):
+    """Keep only the N most recent checkpoints."""
+    checkpoints = sorted(glob.glob(f'checkpoint_{name}_epoch_*.pt'))
+    if len(checkpoints) > keep_last_n:
+        for checkpoint in checkpoints[:-keep_last_n]:
+            os.remove(checkpoint)
+            logger.info(f"Removed old checkpoint: {checkpoint}")
+
+def resume_from_checkpoint(checkpoint_path, model, trainer, start_epoch):
+    """Resume training from a checkpoint."""
+    checkpoint = torch.load(checkpoint_path)
+    
+    # Load model and optimizer states
+    model.load_state_dict(checkpoint['model_state_dict'])
+    trainer.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    
+    # Load metrics history if available
+    # metrics_history = []
+    # metrics_file = checkpoint_path.replace('.pt', '_metrics.json')
+    # if os.path.exists(metrics_file):
+    #     with open(metrics_file, 'r') as f:
+    #         metrics_history = json.load(f)
+    
+    return model, trainer#, metrics_history
+
 def evaluate_novel_detection(trainer, loader, class_weights) -> Dict:
     """Evaluate model's performance on novel family detection."""
     trainer.model.eval()
@@ -459,34 +603,6 @@ def evaluate_novel_detection(trainer, loader, class_weights) -> Dict:
     }
     
     return metrics
-import os 
-import glob
-
-def cleanup_old_checkpoints(name, keep_last_n=5):
-    """Keep only the N most recent checkpoints."""
-    checkpoints = sorted(glob.glob(f'checkpoint_{name}_epoch_*.pt'))
-    if len(checkpoints) > keep_last_n:
-        for checkpoint in checkpoints[:-keep_last_n]:
-            os.remove(checkpoint)
-            logger.info(f"Removed old checkpoint: {checkpoint}")
-
-def resume_from_checkpoint(checkpoint_path, model, trainer, start_epoch):
-    """Resume training from a checkpoint."""
-    checkpoint = torch.load(checkpoint_path)
-    
-    # Load model and optimizer states
-    model.load_state_dict(checkpoint['model_state_dict'])
-    trainer.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-    
-    # Load metrics history if available
-    # metrics_history = []
-    # metrics_file = checkpoint_path.replace('.pt', '_metrics.json')
-    # if os.path.exists(metrics_file):
-    #     with open(metrics_file, 'r') as f:
-    #         metrics_history = json.load(f)
-    
-    return model, trainer#, metrics_history
-
 
 def save_checkpoint(epoch, model, optimizer, metrics, novel_metrics, name, is_best=False):
     """Save training checkpoint and optionally mark as best model."""
@@ -499,23 +615,19 @@ def save_checkpoint(epoch, model, optimizer, metrics, novel_metrics, name, is_be
     }
     
     # Save periodic checkpoint
-    torch.save(checkpoint, f'checkpoint_{name}_epoch_{epoch}.pt')
+    torch.save(checkpoint, f'checkpoint_{name}_epoch_{epoch}_final.pt')
     logger.info(f"Saved checkpoint at epoch {epoch}")
     
     # Optionally save as best model
     if is_best:
-        torch.save(checkpoint, f'best_{name}_model.pt')
+        torch.save(checkpoint, f'best_{name}_model_final.pt')
         logger.info(f"Saved as best model")
-
-
 
 def main():
     # Setup
-    # Memory optimization config
     torch.backends.cudnn.benchmark = True
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-        # Set memory allocator config
         os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
@@ -532,6 +644,8 @@ def main():
     train_loader_groups, train_group_stats = data_loader.load_split('train', use_groups=True, batch_size=32)
     val_loader_family, val_stats = data_loader.load_split('val', use_groups=False, batch_size=32)
     val_loader_groups, val_group_stats = data_loader.load_split('val', use_groups=True, batch_size=32)
+    test_loader_family, test_stats = data_loader.load_split('test', use_groups=False, batch_size=32)
+    test_loader_groups, test_group_stats = data_loader.load_split('test', use_groups=True, batch_size=32)
     
     # Get number of classes
     num_family_classes = data_loader.get_num_classes(use_groups=False)
@@ -541,14 +655,13 @@ def main():
         raise ValueError("No classes found in the dataset")
     
     # Initialize models
-    # Initialize models with better parameters
     family_model = MalwareGNN(
         num_node_features=14,
-        hidden_dim=256,  # Increased from 128
+        hidden_dim=256,
         num_classes=num_family_classes,
-        n_centroids_per_class=4,  # Increased from 2
-        num_layers=4,  # New parameter
-        dropout=0.2  # New parameter
+        n_centroids_per_class=4,
+        num_layers=4,
+        dropout=0.2
     ).to(device)
 
     group_model = MalwareGNN(
@@ -560,7 +673,7 @@ def main():
         dropout=0.2
     ).to(device)
     
-    # Initialize trainers with better parameters
+    # Initialize trainers
     family_trainer = MalwareTrainer(
         model=family_model, 
         device=device,
@@ -573,6 +686,7 @@ def main():
         lr=0.001,
         weight_decay=1e-4
     )
+    
     # Compute class weights
     family_weights = family_trainer.compute_class_weights(train_loader_family)
     group_weights = group_trainer.compute_class_weights(train_loader_groups)
@@ -582,12 +696,9 @@ def main():
     
     # Training parameters
     num_epochs = 50
-    # early stopping: less stopping is 
     early_stopping_patience = 15
     best_family_f1 = 0
-    best_family_acc = 0
     best_group_f1 = 0
-    best_group_acc = 0
     family_patience = 0
     group_patience = 0
     
@@ -600,35 +711,57 @@ def main():
         # Train and evaluate family model
         family_train_metrics = family_trainer.train_epoch(train_loader_family, family_weights)
         family_val_metrics = family_trainer.evaluate(val_loader_family, family_weights)
-        family_novel_metrics = evaluate_novel_detection(family_trainer, val_loader_family, family_weights)
+        family_test_metrics = family_trainer.evaluate(test_loader_family, family_weights)
         
         # Train and evaluate group model
         group_train_metrics = group_trainer.train_epoch(train_loader_groups, group_weights)
         group_val_metrics = group_trainer.evaluate(val_loader_groups, group_weights)
-        group_novel_metrics = evaluate_novel_detection(group_trainer, val_loader_groups, group_weights)
+        group_test_metrics = group_trainer.evaluate(test_loader_groups, group_weights)
+        
+        # Generate threshold curves every 10 epochs or on the last epoch
+        if epoch % 10 == 0 or epoch == num_epochs - 1:
+            # Family model novel detection analysis
+            family_novel_results = evaluate_novel_detection_thresholds(
+                family_trainer, 
+                val_loader_family,
+                save_prefix=f'family_epoch_{epoch}'
+            )
+            
+            # Group model novel detection analysis
+            group_novel_results = evaluate_novel_detection_thresholds(
+                group_trainer, 
+                val_loader_groups,
+                save_prefix=f'group_epoch_{epoch}'
+            )
+        else:
+            # Regular novel detection evaluation with default thresholds
+            family_novel_results = evaluate_novel_detection(family_trainer, val_loader_family, family_weights)
+            group_novel_results = evaluate_novel_detection(group_trainer, val_loader_groups, group_weights)
         
         # Save metrics history
         family_metrics_history.append({
             'epoch': epoch,
             'train': family_train_metrics,
             'val': family_val_metrics,
-            'novel_detection': family_novel_metrics
+            'test': family_test_metrics,
+            'novel_detection': family_novel_results
         })
         
         group_metrics_history.append({
             'epoch': epoch,
             'train': group_train_metrics,
             'val': group_val_metrics,
-            'novel_detection': group_novel_metrics
+            'test': group_test_metrics,
+            'novel_detection': group_novel_results
         })
         
         # Save metrics to file
-        with open('family_metrics2.json', 'w') as f:
+        with open('family_metrics_final.json', 'w') as f:
             json.dump(family_metrics_history, f, indent=2, cls=NumpyEncoder)
-        with open('group_metrics2.json', 'w') as f:
+        with open('group_metrics_final.json', 'w') as f:
             json.dump(group_metrics_history, f, indent=2, cls=NumpyEncoder)
         
-        # Early stopping based only on F1 score
+        # Early stopping based on F1 score
         current_family_f1 = family_val_metrics['overall']['f1']
         current_group_f1 = group_val_metrics['overall']['f1']
         
@@ -636,14 +769,15 @@ def main():
         if current_family_f1 > best_family_f1:
             best_family_f1 = current_family_f1
             family_patience = 0
-            torch.save({
-                'epoch': epoch,
-                'model_state_dict': family_model.state_dict(),
-                'optimizer_state_dict': family_trainer.optimizer.state_dict(),
-                'metrics': family_val_metrics,
-                'novel_metrics': family_novel_metrics
-            }, 'best_family_model.pt')
-            logger.info(f"New best family model saved with F1: {best_family_f1:.4f}")
+            save_checkpoint(
+                epoch=epoch,
+                model=family_model,
+                optimizer=family_trainer.optimizer,
+                metrics=family_val_metrics,
+                novel_metrics=family_novel_results,
+                name='family',
+                is_best=True
+            )
         else:
             family_patience += 1
         
@@ -651,17 +785,18 @@ def main():
         if current_group_f1 > best_group_f1:
             best_group_f1 = current_group_f1
             group_patience = 0
-            torch.save({
-                'epoch': epoch,
-                'model_state_dict': group_model.state_dict(),
-                'optimizer_state_dict': group_trainer.optimizer.state_dict(),
-                'metrics': group_val_metrics,
-                'novel_metrics': group_novel_metrics
-            }, 'best_group_model.pt')
-            logger.info(f"New best group model saved with F1: {best_group_f1:.4f}")
+            save_checkpoint(
+                epoch=epoch,
+                model=group_model,
+                optimizer=group_trainer.optimizer,
+                metrics=group_val_metrics,
+                novel_metrics=group_novel_results,
+                name='group',
+                is_best=True
+            )
         else:
             group_patience += 1
-                
+        
         # Early stopping check
         if family_patience >= early_stopping_patience and group_patience >= early_stopping_patience:
             if epoch < 30:  # Minimum number of epochs
@@ -671,14 +806,8 @@ def main():
             else:
                 logger.info(f"Early stopping triggered after {epoch + 1} epochs")
                 break
-
-        # Compute optimal thresholds periodically
-        if epoch % 5 == 0:
-            family_thresholds = family_trainer.compute_optimal_thresholds(val_loader_family)
-            group_thresholds = group_trainer.compute_optimal_thresholds(val_loader_groups)
-            family_trainer.best_thresholds = family_thresholds
-            group_trainer.best_thresholds = group_thresholds
-
+        
+        # Periodic checkpoints
         if epoch % 10 == 0:
             cleanup_old_checkpoints('family', keep_last_n=5)
             cleanup_old_checkpoints('group', keep_last_n=5)
@@ -687,7 +816,7 @@ def main():
                 model=family_model,
                 optimizer=family_trainer.optimizer,
                 metrics=family_val_metrics,
-                novel_metrics=family_novel_metrics,
+                novel_metrics=family_novel_results,
                 name='family'
             )
             save_checkpoint(
@@ -695,57 +824,40 @@ def main():
                 model=group_model,
                 optimizer=group_trainer.optimizer,
                 metrics=group_val_metrics,
-                novel_metrics=group_novel_metrics,
+                novel_metrics=group_novel_results,
                 name='group'
             )
-        
-        # Save best models as before
-        if current_family_f1 > best_family_f1:
-            best_family_f1 = current_family_f1
-            family_patience = 0
-            save_checkpoint(
-                epoch=epoch,
-                model=family_model,
-                optimizer=family_trainer.optimizer,
-                metrics=family_val_metrics,
-                novel_metrics=family_novel_metrics,
-                name='family',
-                is_best=True
-            )
-        
-        # Similar for group model
-        if current_group_f1 > best_group_f1:
-            best_group_f1 = current_group_f1
-            group_patience = 0
-            save_checkpoint(
-                epoch=epoch,
-                model=group_model,
-                optimizer=group_trainer.optimizer,
-                metrics=group_val_metrics,
-                novel_metrics=group_novel_metrics,
-                name='group',
-                is_best=True
-            )
+            
         # Step the schedulers
         family_trainer.scheduler.step(family_val_metrics['overall']['f1'])
         group_trainer.scheduler.step(group_val_metrics['overall']['f1'])
 
-    # Load test data and evaluate
-    test_loader_family, test_stats = data_loader.load_split('test', use_groups=False, batch_size=32)
-    test_loader_groups, test_group_stats = data_loader.load_split('test', use_groups=True, batch_size=32)
+    # Final evaluation on test set
+    logger.info("Performing final evaluation on test set...")
     
     # Load best models
-    family_checkpoint = torch.load('best_family_model.pt')
+    family_checkpoint = torch.load('best_family_model_final.pt')
     family_model.load_state_dict(family_checkpoint['model_state_dict'])
     
-    group_checkpoint = torch.load('best_group_model.pt')
+    group_checkpoint = torch.load('best_group_model_final.pt')
     group_model.load_state_dict(group_checkpoint['model_state_dict'])
     
-    # Final test evaluation
+    # Test set evaluation with PR curves
     test_family_metrics = family_trainer.evaluate(test_loader_family, family_weights)
     test_group_metrics = group_trainer.evaluate(test_loader_groups, group_weights)
-    test_family_novel = evaluate_novel_detection(family_trainer, test_loader_family, family_weights)
-    test_group_novel = evaluate_novel_detection(group_trainer, test_loader_groups, group_weights)
+    
+    # Generate final PR curves on test set
+    test_family_novel = evaluate_novel_detection_thresholds(
+        family_trainer, 
+        test_loader_family,
+        save_prefix='family_test_final'
+    )
+    
+    test_group_novel = evaluate_novel_detection_thresholds(
+        group_trainer, 
+        test_loader_groups,
+        save_prefix='group_test_final'
+    )
     
     # Save final report
     final_report = {
@@ -791,11 +903,8 @@ def main():
         }
     }
     
-    with open('final_report2.json', 'w') as f:
+    with open('final_report_final.json', 'w') as f:
         json.dump(final_report, f, indent=2, cls=NumpyEncoder)
-
-
 
 if __name__ == "__main__":
     main()
-

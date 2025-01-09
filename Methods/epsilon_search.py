@@ -8,184 +8,32 @@ import torch
 from TemporalGNN import TemporalMalwareDataLoader, NumpyEncoder, evaluate_novel_detection
 from sklearn.metrics import classification_report
 from gcn import MalwareGNN, MalwareTrainer
-
 import torch.nn.functional as F
-from pathlib import Path
-from sklearn.metrics import classification_report
-import logging
-from typing import Dict, List
+from sklearn.metrics import precision_recall_curve, average_precision_score
+import torch
 import matplotlib.pyplot as plt
+from pathlib import Path
+from tqdm import tqdm
+import logging
+from typing import Dict, List, Tuple
 from torch_geometric.data import Data
-
-# Import your existing classes
-from TemporalGNN import TemporalMalwareDataLoader, NumpyEncoder
-from gcn import MalwareGNN
-
-
 import torch
 import torch.nn.functional as F
+from sklearn.metrics import precision_recall_curve, average_precision_score
 import numpy as np
-from pathlib import Path
-from sklearn.metrics import classification_report
-import logging
-import json
-from typing import Dict, List
 import matplotlib.pyplot as plt
+from tqdm import tqdm
+import logging
+from typing import Dict, List, Tuple
 
-# Import your existing classes
-from TemporalGNN import TemporalMalwareDataLoader, NumpyEncoder
-from gcn import MalwareGNN
-
-# Setup logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 class EpsilonAnalyzer:
-    def __init__(self, model_path: str, device: torch.device):
+    def __init__(self, model, device):
+        self.model = model
         self.device = device
-        self.model_path = model_path
+        self.model.eval()
         
-        # Load checkpoint
-        logger.info(f"Loading checkpoint from {model_path}")
-        self.checkpoint = torch.load(model_path, map_location=device)
-        
-        # Get model dimensions from checkpoint
-        centroid_shape = self.checkpoint['model_state_dict']['centroid.centroids'].shape
-        self.n_centroids_per_class = 4
-        self.num_classes = centroid_shape[0] // self.n_centroids_per_class
-        self.hidden_dim = centroid_shape[1] // 4
-        
-        logger.info(f"Model dimensions - Classes: {self.num_classes}, Hidden dim: {self.hidden_dim}")
-        
-        # Initialize model
-        self.model = self._init_model()
-        
-    def _init_model(self) -> MalwareGNN:
-        model = MalwareGNN(
-            num_node_features=14,
-            hidden_dim=self.hidden_dim,
-            num_classes=self.num_classes,
-            n_centroids_per_class=self.n_centroids_per_class,
-            num_layers=4,
-            dropout=0.2
-        ).to(self.device)
-        
-        model.load_state_dict(self.checkpoint['model_state_dict'])
-        model.eval()
-        return model
-    
-    def evaluate_epsilon(self, loader, epsilon: float, test_mode: bool = False) -> Dict:
-        """Evaluate model performance with a specific epsilon threshold
-        Args:
-            loader: DataLoader
-            epsilon: float threshold value
-            test_mode: if True, only process first few batches
-        """
-        predictions = []
-        labels = []
-        outlier_scores = []
-        logits_list = []
-        
-        # Enable gradient checkpointing for memory efficiency
-        self.model.use_checkpointing = True
-        
-        with torch.no_grad():
-            # Process only first few batches if in test mode
-            max_test_batches = 3 if test_mode else float('inf')
-            for batch_idx, batch in enumerate(loader):
-                if test_mode and batch_idx >= max_test_batches:
-                    logger.info(f"Test mode: stopping after {max_test_batches} batches")
-                    break
-                try:
-                    batch = batch.to(self.device)
-                    
-                    # Process in chunks if graph is large
-                    if hasattr(batch, 'x') and batch.x.size(0) > 50000:
-                        logger.info(f"Processing large graph with {batch.x.size(0)} nodes in chunks...")
-                        batch_logits, batch_outlier_scores = self.process_large_graph(batch)
-                    else:
-                        batch_logits, batch_outlier_scores = self.model(batch)
-                    
-                    # Move results to CPU immediately to free GPU memory
-                    batch_logits = batch_logits.cpu()
-                    batch_outlier_scores = batch_outlier_scores.cpu()
-                    batch_labels = batch.y.cpu()
-                    
-                    # Verify sizes match before storing
-                    if len(batch_logits) != len(batch_labels):
-                        logger.warning(f"Size mismatch in batch {batch_idx}: logits={len(batch_logits)}, labels={len(batch_labels)}")
-                        continue
-                        
-                    # Store intermediate results
-                    logits_list.append(batch_logits)
-                    outlier_scores.append(batch_outlier_scores)
-                    labels.append(batch_labels)
-                    
-                    # Log progress with sizes
-                    if batch_idx % 10 == 0:
-                        logger.info(f"Batch {batch_idx}: Processed {len(batch_labels)} samples")
-                    
-                    if batch_idx % 10 == 0:
-                        logger.info(f"Processed batch {batch_idx}/{len(loader)}")
-                    
-                    # Clear cache periodically
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-                        
-                except RuntimeError as e:
-                    if "out of memory" in str(e):
-                        logger.error(f"OOM in batch {batch_idx}, attempting recovery...")
-                        if torch.cuda.is_available():
-                            torch.cuda.empty_cache()
-                        continue
-                    else:
-                        raise e
-                except Exception as e:
-                    logger.error(f"Error in batch {batch_idx}: {str(e)}")
-                    continue
-        
-        # Concatenate all results
-        try:
-            logits = torch.cat(logits_list)
-            outlier_scores = torch.cat(outlier_scores)
-            labels = torch.cat(labels)
-            
-            # Convert logits to distances (they're negative distances)
-            distances = -logits
-            
-            # Get minimum distance to any class
-            min_distances, _ = distances.min(dim=1)
-            
-            # Create outlier mask based on epsilon
-            outlier_mask = min_distances > epsilon
-            
-            # Get predictions
-            probs = F.softmax(-distances, dim=1)
-            probs[outlier_mask] = 0  # Zero out probabilities for outliers
-            pred = torch.argmax(probs, dim=1)
-            pred[outlier_mask] = -1  # Mark outliers as -1
-            
-            predictions = pred.numpy()
-            labels = labels.numpy()
-            
-            # Calculate metrics
-            metrics = {
-                'classification_report': classification_report(labels, predictions, output_dict=True),
-                'stats': {
-                    'epsilon': epsilon,
-                    'mean_distance': float(min_distances.mean()),
-                    'std_distance': float(min_distances.std()),
-                    'num_outliers': int(outlier_mask.sum()),
-                    'total_samples': len(predictions)
-                }
-            }
-            
-            return metrics
-            
-        except Exception as e:
-            logger.error(f"Error in final processing: {str(e)}")
-            raise
-    
     def process_large_graph(self, batch, num_chunks=4):
         """Process a large graph by splitting it into chunks"""
         x, edge_index = batch.x, batch.edge_index
@@ -218,7 +66,7 @@ class EpsilonAnalyzer:
             
             for i in range(0, num_nodes, chunk_size):
                 end_idx = min(i + chunk_size, num_nodes)
-                chunk_mask = torch.arange(i, end_idx, device=x.device)
+                chunk_mask = torch.arange(i, end_idx, device=self.device)
                 
                 # Get chunk data
                 chunk_x = graph_x[chunk_mask]
@@ -230,8 +78,8 @@ class EpsilonAnalyzer:
                 
                 # Process chunk
                 chunk_batch = torch.zeros(len(chunk_x), dtype=torch.long, device=self.device)
-                with torch.amp.autocast('cuda'):
-                    chunk_data = Data(x=chunk_x, edge_index=chunk_edges, batch=chunk_batch)
+                chunk_data = Data(x=chunk_x, edge_index=chunk_edges, batch=chunk_batch)
+                with torch.amp.autocast(device_type='cuda'):
                     chunk_logits, chunk_scores = self.model(chunk_data)
                     graph_logits.append(chunk_logits)
                     graph_scores.append(chunk_scores)
@@ -248,305 +96,257 @@ class EpsilonAnalyzer:
             raise ValueError(f"Expected {num_graphs} results, but got {len(all_logits)}")
             
         return torch.cat(all_logits), torch.cat(all_outlier_scores)
+
+    def collect_predictions(self, loader, test_mode: bool = False) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Collect all raw predictions and scores for later analysis.
+        Returns:
+            distances: Array of minimum distances to centroids
+            is_novel: Array of true novelty labels
+            confidences: Array of prediction confidences
+        """
+        all_distances = []
+        all_is_novel = []
+        all_confidences = []
+        
+        with torch.no_grad():
+            for batch_idx, batch in enumerate(tqdm(loader, desc="Collecting predictions")):
+                # If in test mode, only process first 3 batches
+                if test_mode and batch_idx >= 3:
+                    logger.info("Test mode: stopping after 3 batches")
+                    break
+                try:
+                    batch = batch.to(self.device)
+                    
+                    # Check if graph is large and needs chunked processing
+                    if hasattr(batch, 'x') and batch.x.size(0) > 50000:  # Threshold for large graphs
+                        logger.info(f"Processing large graph {batch_idx} with {batch.x.size(0)} nodes in chunks...")
+                        logits, outlier_scores = self.process_large_graph(batch)
+                    else:
+                        logits, outlier_scores = self.model(batch)
+                    
+                    # Convert logits to distances (they're negative distances)
+                    distances = -logits
+                    min_distances, _ = distances.min(dim=1)
+                    
+                    # Get prediction confidences
+                    probs = F.softmax(logits, dim=1)
+                    confidences = probs.max(dim=1)[0]
+                    
+                    # Move to CPU and convert to numpy
+                    all_distances.append(min_distances.cpu().numpy())
+                    all_is_novel.append(batch.is_novel.cpu().numpy())
+                    all_confidences.append(confidences.cpu().numpy())
+                    
+                    # Clear cache periodically
+                    if batch_idx % 10 == 0 and torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                        
+                except RuntimeError as e:
+                    if "out of memory" in str(e):
+                        logger.error(f"OOM error in batch {batch_idx}, attempting recovery...")
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                        continue
+                    raise e
+                    
+        # Debug info for NaN values
+        distances = np.concatenate(all_distances)
+        is_novel = np.concatenate(all_is_novel)
+        confidences = np.concatenate(all_confidences)
+        
+        # save 
+        np.save('distances.npy', distances)
+        np.save('is_novel.npy', is_novel)
+        np.save('confidences.npy', confidences)
+        np.savez('raw_predictions.npz', distances=distances, is_novel=is_novel, confidences=confidences)
+        # Check for NaNs and log info
+        if np.isnan(distances).any():
+            logger.error(f"Found {np.isnan(distances).sum()} NaN values in distances")
+            logger.error(f"Distance stats - min: {np.nanmin(distances)}, max: {np.nanmax(distances)}")
+            nan_indices = np.where(np.isnan(distances))[0]
+            logger.error(f"First few NaN indices: {nan_indices[:5]}")
+            
+        return distances, is_novel, confidences
     
-    def analyze_epsilons(self, loader, epsilons: List[float], test_mode: bool = False) -> Dict:
-        """Analyze model performance across different epsilon values"""
-        results = {}
+    def compute_pr_curve(self, distances: np.ndarray, is_novel: np.ndarray) -> Dict:
+        """
+        Compute precision-recall curve using distances as novelty scores.
+        """
+        # Larger distance = more likely to be novel
+        precision, recall, thresholds = precision_recall_curve(is_novel, distances)
+        ap = average_precision_score(is_novel, distances)
         
-        for epsilon in epsilons:
-            logger.info(f"Evaluating epsilon = {epsilon}")
-            try:
-                results[epsilon] = self.evaluate_epsilon(loader, epsilon, test_mode=test_mode)
-            except Exception as e:
-                logger.error(f"Error evaluating epsilon {epsilon}: {str(e)}")
-                continue
+        return {
+            'precision': precision,
+            'recall': recall,
+            'thresholds': thresholds,
+            'average_precision': ap
+        }
+    
+    def analyze_thresholds(self, loader, num_thresholds: int = 50, test_mode: bool = False) -> Dict:
+        """
+        Perform complete threshold analysis including PR curves.
+        """
+        # Collect all predictions
+        logger.info("Collecting model predictions...")
+        distances, is_novel, confidences = self.collect_predictions(loader, test_mode)
         
-        return results
+        # Compute PR curves
+        logger.info("Computing precision-recall curves...")
+        distance_pr = self.compute_pr_curve(distances, is_novel)
+        confidence_pr = self.compute_pr_curve(-confidences, is_novel)  # Negative because lower confidence = more likely novel
+        
+        # Find optimal thresholds
+        f1_scores_dist = 2 * (distance_pr['precision'] * distance_pr['recall']) / \
+                        (distance_pr['precision'] + distance_pr['recall'] + 1e-10)
+        f1_scores_conf = 2 * (confidence_pr['precision'] * confidence_pr['recall']) / \
+                        (confidence_pr['precision'] + confidence_pr['recall'] + 1e-10)
+        
+        optimal_dist_idx = np.argmax(f1_scores_dist)
+        optimal_conf_idx = np.argmax(f1_scores_conf)
+        
+        return {
+            'distance_based': {
+                'pr_curve': distance_pr,
+                'optimal_threshold': distance_pr['thresholds'][optimal_dist_idx],
+                'optimal_f1': f1_scores_dist[optimal_dist_idx],
+                'optimal_precision': distance_pr['precision'][optimal_dist_idx],
+                'optimal_recall': distance_pr['recall'][optimal_dist_idx]
+            },
+            'confidence_based': {
+                'pr_curve': confidence_pr,
+                'optimal_threshold': -confidence_pr['thresholds'][optimal_conf_idx],  # Convert back to positive
+                'optimal_f1': f1_scores_conf[optimal_conf_idx],
+                'optimal_precision': confidence_pr['precision'][optimal_conf_idx],
+                'optimal_recall': confidence_pr['recall'][optimal_conf_idx]
+            },
+            'statistics': {
+                'distance_stats': {
+                    'mean': float(np.mean(distances)),
+                    'std': float(np.std(distances)),
+                    'min': float(np.min(distances)),
+                    'max': float(np.max(distances))
+                },
+                'confidence_stats': {
+                    'mean': float(np.mean(confidences)),
+                    'std': float(np.std(confidences)),
+                    'min': float(np.min(confidences)),
+                    'max': float(np.max(confidences))
+                },
+                'total_samples': len(distances),
+                'novel_ratio': float(np.mean(is_novel))
+            }
+        }
     
     def plot_results(self, results: Dict, save_path: str = 'epsilon_analysis.png'):
-        """Generate visualization of epsilon analysis results"""
-        epsilons = sorted(list(results.keys()))
+        """Generate comprehensive visualization of the analysis results."""
+        fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(15, 12))
         
-        metrics = {
-            'precision': [],
-            'recall': [],
-            'f1': [],
-            'outliers': []
-        }
-        
-        for epsilon in epsilons:
-            report = results[epsilon]['classification_report']
-            stats = results[epsilon]['stats']
-            
-            # Calculate weighted averages
-            total_support = sum(c['support'] for c in report.values() 
-                              if isinstance(c, dict) and 'support' in c)
-            
-            weighted_metrics = {'precision': 0, 'recall': 0, 'f1': 0}
-            for c in report.values():
-                if isinstance(c, dict) and 'support' in c:
-                    weight = c['support'] / total_support
-                    for metric in weighted_metrics:
-                        weighted_metrics[metric] += c[metric] * weight
-            
-            metrics['precision'].append(weighted_metrics['precision'])
-            metrics['recall'].append(weighted_metrics['recall'])
-            metrics['f1'].append(weighted_metrics['f1'])
-            metrics['outliers'].append(stats['num_outliers'])
-        
-        # Create plot
-        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10))
-        
-        # Plot metrics
-        ax1.plot(epsilons, metrics['precision'], 'b-', label='Precision')
-        ax1.plot(epsilons, metrics['recall'], 'r-', label='Recall')
-        ax1.plot(epsilons, metrics['f1'], 'g-', label='F1')
-        ax1.set_xlabel('Epsilon')
-        ax1.set_ylabel('Score')
-        ax1.set_title('Classification Metrics vs Epsilon')
-        ax1.legend()
+        # Plot distance-based PR curve
+        dist_results = results['distance_based']
+        ax1.plot(dist_results['pr_curve']['recall'], 
+                dist_results['pr_curve']['precision'], 
+                'b-', label=f'AP={dist_results["pr_curve"]["average_precision"]:.3f}')
+        ax1.set_xlabel('Recall')
+        ax1.set_ylabel('Precision')
+        ax1.set_title('Distance-based PR Curve')
         ax1.grid(True)
+        ax1.legend()
         
-        # Plot outlier counts
-        ax2.plot(epsilons, metrics['outliers'], 'm-', label='Outliers')
-        ax2.set_xlabel('Epsilon')
-        ax2.set_ylabel('Count')
-        ax2.set_title('Number of Detected Outliers')
-        ax2.legend()
+        # Plot confidence-based PR curve
+        conf_results = results['confidence_based']
+        ax2.plot(conf_results['pr_curve']['recall'], 
+                conf_results['pr_curve']['precision'], 
+                'r-', label=f'AP={conf_results["pr_curve"]["average_precision"]:.3f}')
+        ax2.set_xlabel('Recall')
+        ax2.set_ylabel('Precision')
+        ax2.set_title('Confidence-based PR Curve')
         ax2.grid(True)
+        ax2.legend()
+        
+        # Plot distance distribution
+        stats = results['statistics']['distance_stats']
+        ax3.hist(np.linspace(stats['min'], stats['max'], 50), bins=50, alpha=0.6)
+        ax3.axvline(dist_results['optimal_threshold'], color='r', linestyle='--', 
+                   label=f'Optimal threshold: {dist_results["optimal_threshold"]:.3f}')
+        ax3.set_xlabel('Distance')
+        ax3.set_ylabel('Count')
+        ax3.set_title('Distance Distribution')
+        ax3.legend()
+        ax3.grid(True)
+        
+        # Plot confidence distribution
+        stats = results['statistics']['confidence_stats']
+        ax4.hist(np.linspace(stats['min'], stats['max'], 50), bins=50, alpha=0.6)
+        ax4.axvline(conf_results['optimal_threshold'], color='r', linestyle='--',
+                   label=f'Optimal threshold: {conf_results["optimal_threshold"]:.3f}')
+        ax4.set_xlabel('Confidence')
+        ax4.set_ylabel('Count')
+        ax4.set_title('Confidence Distribution')
+        ax4.legend()
+        ax4.grid(True)
         
         plt.tight_layout()
         plt.savefig(save_path)
         plt.close()
 
-
-def analyze_with_epsilon(model, loader, epsilon, device, confidence_threshold=0.8):
-    """Analyze model performance with specific epsilon threshold"""
-    model.eval()
-    all_predictions = []
-    all_labels = []
-    all_is_novel = []
-    
-    with torch.no_grad():
-        for batch in loader:
-            try:
-                batch = batch.to(device)
-                
-                # Check if graph is large
-                if hasattr(batch, 'x') and batch.x.size(0) > 50000:
-                    logger.info(f"Processing large graph with {batch.x.size(0)} nodes in chunks...")
-                    batch_logits, batch_outlier_scores = process_large_graph(model, batch, device)
-                else:
-                    batch_logits, batch_outlier_scores = model(batch)
-                
-                # Move tensors to CPU to free GPU memory
-                batch_logits = batch_logits.cpu()
-                batch_outlier_scores = batch_outlier_scores.cpu()
-                batch_labels = batch.y.cpu()
-                batch_is_novel = batch.is_novel.cpu()
-                
-                confidences = F.softmax(batch_logits, dim=1).max(dim=1)[0]
-                preds = batch_logits.argmax(dim=1)
-                
-                # A sample is considered novel if either:
-                # 1. It has high outlier score OR
-                # 2. It has low confidence in its prediction
-                novel_mask = (batch_outlier_scores > epsilon) | (confidences < confidence_threshold)
-                preds[novel_mask] = -1  # Mark as novel
-                
-                all_predictions.append(preds.numpy())
-                all_labels.append(batch_labels.numpy())
-                all_is_novel.append(batch_is_novel.numpy())
-                
-                # Clear cache periodically
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                    
-            except RuntimeError as e:
-                if "out of memory" in str(e):
-                    logger.error(f"OOM error, attempting recovery...")
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-                    continue
-                else:
-                    raise e
-    
-    # Concatenate results
-    predictions = np.concatenate(all_predictions)
-    labels = np.concatenate(all_labels)
-    is_novel = np.concatenate(all_is_novel)
-    
-    # Calculate metrics
-    novel_pred = predictions == -1
-    novel_true = is_novel
-    
-    tp = np.sum(novel_pred & novel_true)
-    fp = np.sum(novel_pred & ~novel_true)
-    fn = np.sum(~novel_pred & novel_true)
-    tn = np.sum(~novel_pred & ~novel_true)
-    
-    precision = tp / (tp + fp) if (tp + fp) > 0 else 0
-    recall = tp / (tp + fn) if (tp + fn) > 0 else 0
-    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
-    
-    return {
-        'metrics': {
-            'precision': precision,
-            'recall': recall,
-            'f1': f1,
-        },
-        'counts': {
-            'total': len(predictions),
-            'novel_predictions': np.sum(novel_pred),
-            'true_novel': np.sum(novel_true),
-            'tp': tp,
-            'fp': fp,
-            'fn': fn,
-            'tn': tn
-        }
-    }
-
-def process_large_graph(model, batch, device, num_chunks=4):
-    """Process a large graph by splitting it into chunks"""
-    x, edge_index = batch.x, batch.edge_index
-    batch_idx = batch.batch
-    num_graphs = batch_idx.max().item() + 1
-    
-    all_logits = []
-    all_outlier_scores = []
-    
-    # Process one graph at a time
-    for graph_idx in range(num_graphs):
-        # Get nodes for this graph
-        graph_mask = batch_idx == graph_idx
-        graph_x = x[graph_mask]
-        node_indices = torch.nonzero(graph_mask).squeeze()
-        
-        # Get edges for this graph
-        edge_mask = (edge_index[0] >= node_indices.min()) & (edge_index[0] <= node_indices.max()) & \
-                   (edge_index[1] >= node_indices.min()) & (edge_index[1] <= node_indices.max())
-        graph_edges = edge_index[:, edge_mask]
-        
-        # Adjust edge indices
-        graph_edges = graph_edges - node_indices.min()
-        
-        # Process in chunks if needed
-        num_nodes = graph_x.size(0)
-        chunk_size = num_nodes // num_chunks + 1
-        graph_logits = []
-        graph_scores = []
-        
-        for i in range(0, num_nodes, chunk_size):
-            end_idx = min(i + chunk_size, num_nodes)
-            chunk_mask = torch.arange(i, end_idx, device=device)
-            
-            # Get chunk data
-            chunk_x = graph_x[chunk_mask]
-            chunk_edges = graph_edges.clone()
-            edge_mask = (chunk_edges[0] >= i) & (chunk_edges[0] < end_idx) & \
-                       (chunk_edges[1] >= i) & (chunk_edges[1] < end_idx)
-            chunk_edges = chunk_edges[:, edge_mask]
-            chunk_edges = chunk_edges - i
-            
-            # Process chunk
-            chunk_batch = torch.zeros(len(chunk_x), dtype=torch.long, device=device)
-            with torch.amp.autocast('cuda'):
-                chunk_data = Data(x=chunk_x, edge_index=chunk_edges, batch=chunk_batch)
-                chunk_logits, chunk_scores = model(chunk_data)
-                graph_logits.append(chunk_logits)
-                graph_scores.append(chunk_scores)
-        
-        # Aggregate chunks for this graph
-        if graph_logits:
-            graph_logits = torch.cat(graph_logits).mean(dim=0, keepdim=True)
-            graph_scores = torch.cat(graph_scores).mean(dim=0, keepdim=True)
-            all_logits.append(graph_logits)
-            all_outlier_scores.append(graph_scores)
-    
-    # Ensure we have results for each graph
-    if len(all_logits) != num_graphs:
-        raise ValueError(f"Expected {num_graphs} results, but got {len(all_logits)}")
-        
-    return torch.cat(all_logits), torch.cat(all_outlier_scores)
-
 def main():
-    # Setup
+    # Add argument parser for test mode
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--test', action='store_true', help='Run in test mode with limited batches')
+    args = parser.parse_args()
+
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
-    # Load your trained model
-    checkpoint = torch.load('checkpoint_family_epoch_40.pt', map_location=device)
-    
-    # Get model dimensions from checkpoint
-    centroid_shape = checkpoint['model_state_dict']['centroid.centroids'].shape
-    n_centroids_per_class = 4
-    num_classes = centroid_shape[0] // n_centroids_per_class
-    hidden_dim = centroid_shape[1] // 4
+    # Load your model and data
+    model_path = 'best_family_model.pt'
+    checkpoint = torch.load(model_path, map_location=device)
     
     # Initialize model
     model = MalwareGNN(
         num_node_features=14,
-        hidden_dim=hidden_dim,
-        num_classes=num_classes,
-        n_centroids_per_class=n_centroids_per_class,
+        hidden_dim=256,
+        num_classes=checkpoint['model_state_dict']['centroid.centroids'].shape[0] // 4,
+        n_centroids_per_class=4,
         num_layers=4,
         dropout=0.2
     ).to(device)
     
     model.load_state_dict(checkpoint['model_state_dict'])
-    model.eval()
     
     # Initialize data loader
     data_loader = TemporalMalwareDataLoader(
-        batch_dir=Path('/data/saranyav/gcn_new/bodmas_batches'),
+        batch_dir=Path('bodmas_batches'),
         behavioral_groups_path=Path('/data/saranyav/gcn_new/behavioral_analysis/behavioral_groups.json'),
         metadata_path=Path('bodmas_metadata_cleaned.csv'),
         malware_types_path=Path('bodmas_malware_category.csv')
     )
     
-    # Load test data with smaller batch size for large graphs
-    test_loader, _ = data_loader.load_split('test', use_groups=False, batch_size=8)
+    # Load test data - reduce batch size for large graphs
+    batch_size = 8 if args.test else 32
+    test_loader, _ = data_loader.load_split('test', use_groups=False, batch_size=batch_size)
     
-    # Test different epsilon values around 0.7
-    epsilons = [0.3, 0.5, 0.6, 0.7, 0.8, 0.9, 1.1]  # Test range around original 0.7
-    results = {}
+    if args.test:
+        logger.info("Running in test mode with 3 batches")
+        
+    # Run analysis
+    analyzer = EpsilonAnalyzer(model, device)
+    results = analyzer.analyze_thresholds(test_loader, test_mode=args.test)
     
-    # Test each epsilon value
-    for epsilon in epsilons:
-        logger.info(f"Testing epsilon = {epsilon}")
-        results[epsilon] = analyze_with_epsilon(model, test_loader, epsilon, device)
+    # Plot and save results
+    plot_suffix = '_test' if args.test else ''
+    analyzer.plot_results(results, save_path=f'epsilon_analysis{plot_suffix}.png')
     
     # Save results
-    with open('epsilon_analysis_results.json', 'w') as f:
+    with open(f'epsilon_results{plot_suffix}.json', 'w') as f:
         json.dump(results, f, indent=2, cls=NumpyEncoder)
     
-    # Plot results
-    f1_scores = [results[e]['metrics']['f1'] for e in epsilons]
-    novel_ratios = [results[e]['counts']['novel_predictions'] / results[e]['counts']['total'] 
-                    for e in epsilons]
-    
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8))
-    
-    # Plot F1 scores
-    ax1.plot(epsilons, f1_scores, 'b-', marker='o')
-    ax1.axvline(x=0.7, color='r', linestyle='--', label='Original ε')
-    ax1.set_xlabel('Epsilon')
-    ax1.set_ylabel('F1 Score')
-    ax1.set_title('Novel Detection F1 Score vs Epsilon')
-    ax1.grid(True)
-    ax1.legend()
-    
-    # Plot novel detection ratio
-    ax2.plot(epsilons, novel_ratios, 'g-', marker='o')
-    ax2.axvline(x=0.7, color='r', linestyle='--', label='Original ε')
-    ax2.set_xlabel('Epsilon')
-    ax2.set_ylabel('Novel Detection Ratio')
-    ax2.set_title('Ratio of Samples Marked as Novel vs Epsilon')
-    ax2.grid(True)
-    ax2.legend()
-    
-    plt.tight_layout()
-    plt.savefig('epsilon_analysis.png')
-    plt.close()
+    # Print optimal thresholds
+    print("\nOptimal Thresholds:")
+    print(f"Distance-based: {results['distance_based']['optimal_threshold']:.3f}")
+    print(f"Confidence-based: {results['confidence_based']['optimal_threshold']:.3f}")
 
 if __name__ == "__main__":
     main()
